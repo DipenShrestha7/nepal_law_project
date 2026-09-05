@@ -1,4 +1,9 @@
 {
   "venvPath": ".",
-  "venv": ".venv"
+  "venv": ".venv",
+  "extraPaths": [
+    ".",
+    "scraping",
+    "scraping/ingester/np"
+  ]
 }
