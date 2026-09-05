@@ -9,7 +9,7 @@ from qdrant_client.models import VectorParams, Distance, PointStruct
 from dotenv import load_dotenv
 
 load_dotenv()
-PDF_PATH = "data/raw_pdfs/en/constitution_.pdf"
+PDF_PATH = "data/raw_pdfs/en/constitution.pdf"
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = "nepal_laws"

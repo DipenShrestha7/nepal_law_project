@@ -18,6 +18,7 @@ __pycache__/
 *$py.class
 *.so
 .pytest_cache/
+testing/
 
 # ==========================================
 # Data Pipeline & Raw Files
