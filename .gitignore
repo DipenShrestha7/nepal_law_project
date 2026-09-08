@@ -24,6 +24,7 @@ testing/
 # Data Pipeline & Raw Files
 # ==========================================
 # Ignore scraped raw PDFs and temporary output data
+data/raw_pdfs/
 data/raw_pdfs/*
 data/parsed_json/*
 data/qdrant_payloads/*

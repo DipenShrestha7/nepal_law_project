@@ -20,7 +20,7 @@ QDRANT_URL = os.getenv("QDRANT_URL", "")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 COLLECTION_NAME = "nepal_laws"
 
-ACTS_DIR = Path("data/raw_pdfs/np/Acts")
+ACTS_DIR = Path("data/raw_pdfs/np/Act_Not_In_Volume")
 LOG_FILE = Path("data/acts_ingestion_log.json")
 
 # Model and client initialization with 180s HTTP timeout

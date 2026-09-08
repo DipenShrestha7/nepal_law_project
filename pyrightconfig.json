@@ -5,5 +5,11 @@
     ".",
     "scraping",
     "scraping/ingester/np"
+  ],
+  "exclude": [
+    ".venv",
+    "data",
+    "**/chunks_cache",
+    "**/downloaded_pdfs"
   ]
 }
