@@ -1,22 +1,23 @@
 import os
+import re
 from typing import Any, Dict, List, TypedDict
-
+import unicodedata
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
+from chatbot.prompt.legal_system_prompt import LEGAL_SYSTEM_PROMPT
 
 load_dotenv()
 
-# ==========================================
-# 1. CONFIGURATION & CLIENTS
-# ==========================================
+# CONFIGURATION & CLIENTS
 QDRANT_URL = os.getenv("QDRANT_URL", "")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 COLLECTION_NAME = "nepal_laws"
+SCORE_THRESHOLD = 0.32
 
 embedder = SentenceTransformer("BAAI/bge-m3")
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
@@ -33,9 +34,7 @@ llm = ChatOpenAI(
 )
 
 
-# ==========================================
-# 2. DEFINE GRAPH STATE
-# ==========================================
+# DEFINE GRAPH STATE
 class LegalGraphState(TypedDict):
     question: str
     documents: List[Dict[str, Any]]
@@ -43,11 +42,67 @@ class LegalGraphState(TypedDict):
     answer: str
 
 
-# ==========================================
-# 3. DEFINE GRAPH NODES
-# ==========================================
+def clean_llm_output(text: str) -> str:
+    """Strips OpenRouter guardrail metadata headers from LLM completions."""
+    if not text:
+        return ""
+    # Remove "User Safety: safe" or similar system prefixes
+    cleaned = re.sub(r"^User Safety:\s*\w+\s*", "", text, flags=re.IGNORECASE).strip()
+    return cleaned
+
+
+# NEPALI PROMPT TO ENGLISH TRANSLATION
+def prepare_query_node(state: LegalGraphState) -> Dict[str, Any]:
+    """Translates English queries to formal Nepali to ensure 1:1 vector matching with Nepali chunks."""
+    user_query = state["question"]
+
+    # Detect if input is already in Devanagari
+    is_devanagari = any("\u0900" <= char <= "\u097f" for char in user_query)
+
+    if is_devanagari:
+        # If user asked in Nepali, expand with English for dual-search capabilities
+        prompt = f"Translate this legal query into concise English legal terms. Return ONLY the translation:\n{user_query}"
+        en_translation = str(llm.invoke(prompt).content).strip()
+        search_query = f"{user_query} | {en_translation}"
+    else:
+        # If user asked in English, translate to formal Nepali legal terms
+        prompt = f"Translate this legal query into formal Nepali legal terminology used in Nepal Acts. Return ONLY the translated Nepali text:\n{user_query}"
+        np_translation = str(llm.invoke(prompt).content).strip()
+        search_query = f"{np_translation} | {user_query}"
+
+    return {"question": search_query}
+
+
+# FRAGMENTED TEXT REPARATION
+def format_context_node(state: LegalGraphState) -> Dict[str, Any]:
+    """Cleans and repairs Devanagari ligature corruptions before prompting the LLM."""
+    docs = state["documents"]
+    formatted_blocks = []
+
+    for idx, c in enumerate(docs, start=1):
+        raw_content = c["content_text"]
+
+        # 1. Repair Unicode character assembly
+        clean_content = unicodedata.normalize("NFC", raw_content)
+
+        # 2. Fix common PDF extraction artifact spaces inside words
+        clean_content = re.sub(
+            r"(?<=\u0900-\u097F)\s+(?=[\u0902-\u094D])", "", clean_content
+        )
+
+        block = (
+            f"[{idx}] Act/Law: {c['act_title']}\n"
+            f"Chapter: {c['chapter']} | Section/Rule: {c['section_number']}\n"
+            f"Text: {clean_content}\n"
+        )
+        formatted_blocks.append(block)
+
+    return {"context_str": "\n".join(formatted_blocks)}
+
+
+# DEFINE GRAPH NODES
 def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
-    """Node 1: Retrieve top matching legal clauses from Qdrant."""
+    """Node 1: Retrieve top matching legal clauses from Qdrant with score thresholding."""
     question = state["question"]
     query_vector = embedder.encode(question).tolist()
 
@@ -57,16 +112,22 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
 
     docs = []
     for point in search_results:
-        # Fix 2: Safely handle cases where point.payload is None
+        # Reject irrelevant chunks that fall below the quality threshold
+        if point.score < SCORE_THRESHOLD:
+            continue
+
         payload = point.payload or {}
         docs.append(
             {
-                "act_title": payload.get("act_title", "Unknown Law"),
+                "act_title": payload.get(
+                    "act_title", payload.get("title_np", "Unknown Law")
+                ),
                 "chapter": payload.get("chapter", "N/A"),
                 "section_number": payload.get("section_number")
                 or payload.get("rule_number", "N/A"),
                 "title": payload.get("title", ""),
                 "content_text": payload.get("content_text", ""),
+                "score": point.score,
             }
         )
 
@@ -74,39 +135,47 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
 
 
 def format_context_node(state: LegalGraphState) -> Dict[str, Any]:
-    """Node 2: Format retrieved chunks into a clean prompt string."""
+    """Node 2: Format retrieved chunks into a clean prompt string with Devanagari repair."""
     docs = state["documents"]
-    formatted_blocks = []
 
+    if not docs:
+        return {"context_str": ""}
+
+    formatted_blocks = []
     for idx, c in enumerate(docs, start=1):
+        raw_text = c["content_text"]
+
+        # 1. Fix broken Devanagari Unicode ligatures on the fly
+        clean_text = unicodedata.normalize("NFC", raw_text)
+
+        # 2. Remove illegal spaces inserted between Nepali letters and vowel signs (matras)
+        clean_text = re.sub(r"(?<=\u0900-\u097F)\s+(?=[\u0902-\u094D])", "", clean_text)
+
         block = (
-            f"[{idx}] Law: {c['act_title']} | Chapter: {c['chapter']} | Section: {c['section_number']}\n"
+            f"[{idx}] Law: {c['act_title']} | Chapter: {c['chapter']} | Section/Rule: {c['section_number']}\n"
             f"Title: {c['title']}\n"
-            f"Content: {c['content_text']}\n"
+            f"Content: {clean_text}\n"
         )
         formatted_blocks.append(block)
 
-    return {"context_str": "\n".join(formatted_blocks)}
+    return {"context_str": "\n\n".join(formatted_blocks)}
 
 
 def generate_answer_node(state: LegalGraphState) -> Dict[str, Any]:
-    """Node 3: Generate legal answer using OpenRouter LLM."""
     question = state["question"]
     context = state["context_str"]
 
-    system_prompt = (
-        "You are an expert legal assistant specializing in the legal system of Nepal.\n"
-        "Answer the user's query strictly based on the provided retrieved legal context.\n\n"
-        "RULES:\n"
-        "1. Always cite specific Acts, Chapters, and Section/Rule numbers in your explanation.\n"
-        "2. If asked in Devanagari/Nepali, reply in Nepali. If asked in English, reply in English.\n"
-        "3. If the context does not contain sufficient legal proof, state clearly that the provision was not found."
-    )
+    if not state["documents"]:
+        return {
+            "answer": "The requested legal provision was not found in the Nepali legal database."
+        }
+
+    system_prompt = LEGAL_SYSTEM_PROMPT
 
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(
-            content=f"RETRIEVED LEGAL CONTEXT:\n{context}\n\nUSER QUESTION: {question}"
+            content=f"<context>\n{context}\n</context>\n\nUSER QUESTION: {question}"
         ),
     ]
 
@@ -114,9 +183,7 @@ def generate_answer_node(state: LegalGraphState) -> Dict[str, Any]:
     return {"answer": str(response.content)}
 
 
-# ==========================================
-# 4. BUILD LANGGRAPH WORKFLOW
-# ==========================================
+# BUILD LANGGRAPH WORKFLOW
 def build_legal_rag_graph():
     workflow = StateGraph(LegalGraphState)  # type: ignore[bad-specialization]
 
@@ -132,9 +199,7 @@ def build_legal_rag_graph():
     return workflow.compile()
 
 
-# ==========================================
-# 5. EXECUTION LOOP
-# ==========================================
+# EXECUTION LOOP
 if __name__ == "__main__":
     app = build_legal_rag_graph()
 
