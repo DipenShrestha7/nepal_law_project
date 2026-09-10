@@ -1,4 +1,3 @@
-import os
 import re
 from typing import Any, Dict, List, TypedDict
 import unicodedata
@@ -8,16 +7,14 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
-from chatbot.prompt.legal_system_prompt import LEGAL_SYSTEM_PROMPT
-
-load_dotenv()
-
-# CONFIGURATION & CLIENTS
-QDRANT_URL = os.getenv("QDRANT_URL", "")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-COLLECTION_NAME = "nepal_laws"
-SCORE_THRESHOLD = 0.32
+from prompt.legal_system_prompt import LEGAL_SYSTEM_PROMPT
+from config import (
+    QDRANT_URL,
+    QDRANT_API_KEY,
+    OPENROUTER_API_KEY,
+    COLLECTION_NAME,
+    SCORE_THRESHOLD,
+)
 
 embedder = SentenceTransformer("BAAI/bge-m3")
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
@@ -33,8 +30,13 @@ llm = ChatOpenAI(
     },
 )
 
+LEGAL_TERM_CORRECTIONS = {
+    "जुर्माना": "जरिबाना",
+    "कट-ऑफ": "अन्तिम सीमा",
+    "फाइनान्सियल": "आर्थिक",
+}
 
-# DEFINE GRAPH STATE
+
 class LegalGraphState(TypedDict):
     question: str
     documents: List[Dict[str, Any]]
@@ -42,67 +44,106 @@ class LegalGraphState(TypedDict):
     answer: str
 
 
-def clean_llm_output(text: str) -> str:
-    """Strips OpenRouter guardrail metadata headers from LLM completions."""
+# HELPER UTILITIES
+def preprocess_devanagari_text(text: str) -> str:
+    """Repairs Devanagari Unicode ligatures, matra transpositions, and space glitches."""
     if not text:
         return ""
-    # Remove "User Safety: safe" or similar system prefixes
-    cleaned = re.sub(r"^User Safety:\s*\w+\s*", "", text, flags=re.IGNORECASE).strip()
-    return cleaned
+
+    # 1. Unicode NFC Normalization
+    text = unicodedata.normalize("NFC", text)
+
+    # 2. Fix transposed short-I matra (ि) occurring before consonants/conjuncts
+    text = re.sub(r"ि([\u0915-\u0939](?:्[\u0915-\u0939])*)", r"\1ि", text)
+
+    # 3. Fix detached halants (्) followed by spaces
+    text = re.sub(r"्\s+", "्", text)
+
+    # 4. Remove artificial spaces inserted between letters and matras
+    text = re.sub(r"(?<=\u0900-\u097F)\s+(?=[\u0902-\u094D])", "", text)
+
+    return text.strip()
 
 
-# NEPALI PROMPT TO ENGLISH TRANSLATION
+def clean_llm_output(text: str) -> str:
+    """Strips OpenRouter guardrail metadata headers from completion strings."""
+    if not text:
+        return ""
+    return re.sub(r"^User Safety:\s*\w+\s*", "", text, flags=re.IGNORECASE).strip()
+
+
+# GRAPH NODES
 def prepare_query_node(state: LegalGraphState) -> Dict[str, Any]:
-    """Translates English queries to formal Nepali to ensure 1:1 vector matching with Nepali chunks."""
-    user_query = state["question"]
+    """Translates English queries to Nepali legal terminology to ensure high vector similarity."""
+    user_query = state["question"].strip()
 
-    # Detect if input is already in Devanagari
+    # Detect if input contains Devanagari characters
     is_devanagari = any("\u0900" <= char <= "\u097f" for char in user_query)
 
-    if is_devanagari:
-        # If user asked in Nepali, expand with English for dual-search capabilities
-        prompt = f"Translate this legal query into concise English legal terms. Return ONLY the translation:\n{user_query}"
-        en_translation = str(llm.invoke(prompt).content).strip()
-        search_query = f"{user_query} | {en_translation}"
+    if not is_devanagari:
+        # Use LLM to extract Nepali legal search keywords
+        translation_prompt = (
+            f"Translate this legal query into concise formal Nepali legal terms used in Nepal Acts. "
+            f"Return ONLY the translated Nepali terms without explanation:\n{user_query}"
+        )
+        translated_query = str(llm.invoke(translation_prompt).content).strip()
+        search_query = f"{translated_query} | {user_query}"
     else:
-        # If user asked in English, translate to formal Nepali legal terms
-        prompt = f"Translate this legal query into formal Nepali legal terminology used in Nepal Acts. Return ONLY the translated Nepali text:\n{user_query}"
-        np_translation = str(llm.invoke(prompt).content).strip()
-        search_query = f"{np_translation} | {user_query}"
+        search_query = user_query
 
     return {"question": search_query}
 
 
-# FRAGMENTED TEXT REPARATION
-def format_context_node(state: LegalGraphState) -> Dict[str, Any]:
-    """Cleans and repairs Devanagari ligature corruptions before prompting the LLM."""
-    docs = state["documents"]
-    formatted_blocks = []
+def extract_payload_metadata(point) -> Dict[str, Any]:
+    """Safely retrieves chunk fields across varying document payload schemas."""
+    payload = point.payload or {}
 
-    for idx, c in enumerate(docs, start=1):
-        raw_content = c["content_text"]
+    # 1. Fallback chain for Document / Act Title
+    act_title = (
+        payload.get("act_title")
+        or payload.get("title_np")
+        or payload.get("file_name", "Unknown Law").replace(".pdf", "")
+    )
 
-        # 1. Repair Unicode character assembly
-        clean_content = unicodedata.normalize("NFC", raw_content)
+    # 2. Fallback chain for Section / Rule / Clause Number
+    section_num = (
+        payload.get("section_number")
+        or payload.get("rule_number")
+        or payload.get("clause_label")
+        or payload.get("section_no")
+        or "N/A"
+    )
 
-        # 2. Fix common PDF extraction artifact spaces inside words
-        clean_content = re.sub(
-            r"(?<=\u0900-\u097F)\s+(?=[\u0902-\u094D])", "", clean_content
-        )
+    # 3. Fallback chain for Chapter / Part
+    chapter = (
+        payload.get("chapter")
+        or payload.get("part")
+        or payload.get("category")
+        or "N/A"
+    )
 
-        block = (
-            f"[{idx}] Act/Law: {c['act_title']}\n"
-            f"Chapter: {c['chapter']} | Section/Rule: {c['section_number']}\n"
-            f"Text: {clean_content}\n"
-        )
-        formatted_blocks.append(block)
+    # 4. Fallback chain for Main Content Text
+    content_text = (
+        payload.get("content_text")
+        or payload.get("text")
+        or payload.get("chunk_text")
+        or ""
+    )
 
-    return {"context_str": "\n".join(formatted_blocks)}
+    # 5. Section / Chunk Title
+    title = payload.get("title") or payload.get("doc_type") or ""
+
+    return {
+        "act_title": act_title,
+        "chapter": chapter,
+        "section_number": section_num,
+        "title": title,
+        "content_text": content_text,
+        "score": point.score,
+    }
 
 
-# DEFINE GRAPH NODES
 def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
-    """Node 1: Retrieve top matching legal clauses from Qdrant with score thresholding."""
     question = state["question"]
     query_vector = embedder.encode(question).tolist()
 
@@ -112,30 +153,18 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
 
     docs = []
     for point in search_results:
-        # Reject irrelevant chunks that fall below the quality threshold
         if point.score < SCORE_THRESHOLD:
             continue
 
-        payload = point.payload or {}
-        docs.append(
-            {
-                "act_title": payload.get(
-                    "act_title", payload.get("title_np", "Unknown Law")
-                ),
-                "chapter": payload.get("chapter", "N/A"),
-                "section_number": payload.get("section_number")
-                or payload.get("rule_number", "N/A"),
-                "title": payload.get("title", ""),
-                "content_text": payload.get("content_text", ""),
-                "score": point.score,
-            }
-        )
+        # Extract normalized metadata fields regardless of schema differences
+        chunk_data = extract_payload_metadata(point)
+        docs.append(chunk_data)
 
     return {"documents": docs}
 
 
 def format_context_node(state: LegalGraphState) -> Dict[str, Any]:
-    """Node 2: Format retrieved chunks into a clean prompt string with Devanagari repair."""
+    """Node 2: Formats retrieved chunks into a clean prompt string with active Devanagari repair."""
     docs = state["documents"]
 
     if not docs:
@@ -143,13 +172,8 @@ def format_context_node(state: LegalGraphState) -> Dict[str, Any]:
 
     formatted_blocks = []
     for idx, c in enumerate(docs, start=1):
-        raw_text = c["content_text"]
-
-        # 1. Fix broken Devanagari Unicode ligatures on the fly
-        clean_text = unicodedata.normalize("NFC", raw_text)
-
-        # 2. Remove illegal spaces inserted between Nepali letters and vowel signs (matras)
-        clean_text = re.sub(r"(?<=\u0900-\u097F)\s+(?=[\u0902-\u094D])", "", clean_text)
+        # Run active character/matra cleaning pass on retrieved text
+        clean_text = preprocess_devanagari_text(c["content_text"])
 
         block = (
             f"[{idx}] Law: {c['act_title']} | Chapter: {c['chapter']} | Section/Rule: {c['section_number']}\n"
@@ -162,6 +186,7 @@ def format_context_node(state: LegalGraphState) -> Dict[str, Any]:
 
 
 def generate_answer_node(state: LegalGraphState) -> Dict[str, Any]:
+    """Node 3: Prompts OpenRouter LLM with strictly grounded context."""
     question = state["question"]
     context = state["context_str"]
 
@@ -170,31 +195,58 @@ def generate_answer_node(state: LegalGraphState) -> Dict[str, Any]:
             "answer": "The requested legal provision was not found in the Nepali legal database."
         }
 
-    system_prompt = LEGAL_SYSTEM_PROMPT
-
     messages = [
-        SystemMessage(content=system_prompt),
+        SystemMessage(content=LEGAL_SYSTEM_PROMPT),
         HumanMessage(
             content=f"<context>\n{context}\n</context>\n\nUSER QUESTION: {question}"
         ),
     ]
 
     response = llm.invoke(messages)
-    return {"answer": str(response.content)}
+    raw_answer = str(response.content)
+
+    # Clean OpenRouter system headers immediately
+    cleaned_answer = clean_llm_output(raw_answer)
+
+    return {"answer": cleaned_answer}
 
 
-# BUILD LANGGRAPH WORKFLOW
+def sanitize_legal_output_node(state: LegalGraphState) -> Dict[str, Any]:
+    """Node 4: Post-processes output to enforce exact Nepali legal terminology."""
+    text = state["answer"]
+
+    # 1. Replace terminology drifts (e.g., 'जुर्माना' -> 'जरिबाना')
+    for bad_term, good_term in LEGAL_TERM_CORRECTIONS.items():
+        text = text.replace(bad_term, good_term)
+
+    # 2. Convert 'धारा' to 'दफा' when referencing Acts (and not the Constitution)
+    is_act = any("ऐन" in doc.get("act_title", "") for doc in state["documents"])
+    if is_act:
+        text = re.sub(r"धारा\s*([०-९\d]+)", r"दफा \1", text)
+
+    return {"answer": text}
+
+
+# WORKFLOW BUILDER
 def build_legal_rag_graph():
-    workflow = StateGraph(LegalGraphState)  # type: ignore[bad-specialization]
+    workflow = StateGraph(LegalGraphState)
 
+    # 1. Add nodes
+    workflow.add_node("prepare_query", prepare_query_node)
     workflow.add_node("retrieve", retrieve_node)
     workflow.add_node("format_context", format_context_node)
     workflow.add_node("generate", generate_answer_node)
+    workflow.add_node("sanitize_output", sanitize_legal_output_node)
 
-    workflow.set_entry_point("retrieve")
+    # 2. Set entry point
+    workflow.set_entry_point("prepare_query")
+
+    # 3. Connect sequential pipeline
+    workflow.add_edge("prepare_query", "retrieve")
     workflow.add_edge("retrieve", "format_context")
     workflow.add_edge("format_context", "generate")
-    workflow.add_edge("generate", END)
+    workflow.add_edge("generate", "sanitize_output")
+    workflow.add_edge("sanitize_output", END)
 
     return workflow.compile()
 
@@ -203,9 +255,9 @@ def build_legal_rag_graph():
 if __name__ == "__main__":
     app = build_legal_rag_graph()
 
-    print("==================================================")
-    print(" Nepal Legal AI Chatbot (LangGraph Engine Connected)")
-    print("==================================================\n")
+    print("=========================")
+    print(" Nepal Legal AI Chatbot")
+    print("=========================\n")
 
     while True:
         user_input = input("User Query: ").strip()
