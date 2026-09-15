@@ -26,6 +26,7 @@ testing/
 # Ignore scraped raw PDFs and temporary output data
 data/raw_pdfs/
 data/raw_pdfs/*
+data/raw_pdfs_small/np/*
 data/parsed_json/*
 data/qdrant_payloads/*
 
