@@ -46,6 +46,7 @@ QDRANT_URL = os.getenv("QDRANT_URL", "")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 COLLECTION_NAME = "nepal_laws_np"
 VECTOR_SIZE = 1024
+EMBEDDING_MAX_CHARS = 2500
 
 ACTS_DIR = Path("data/raw_pdfs_small/np/Volume")
 LOG_FILE = Path("data/raw_pdfs_small/volume_wise_act.json")
@@ -289,7 +290,7 @@ def parse_act_components(text: str) -> List[Dict[str, Any]]:
 
     # Section parsing regex: matches "1. Title: Content" or "१. संक्षिप्त नाम..."
     section_pattern = (
-        r"(?:^|\n)\s*([०-९\d]+)\.\s*([^\n:]+)\s*[:\n]\s*(.*?)(?=\n\s*[०-९\d]+\.|\Z)"
+        r"(?:^|\n)\s*([०-९\d]+)\s*\.\s*([^\n:]+)\s*[:\n]\s*(.*?)(?=\n\s*[०-९\d]+\s*\.|\Z)"
     )
 
     # 2. Split Document by Chapters (परिच्छेद)
@@ -398,7 +399,9 @@ def ingest_all_volume_wise_acts():
             f"\n[{volume_folder} -> {file_name}] Extracted {len(doc_chunks)} chunks. Vectorizing..."
         )
 
-        chunk_texts = [c["content_text"] for c in doc_chunks]
+        chunk_texts = [
+            c["content_text"][:EMBEDDING_MAX_CHARS] for c in doc_chunks
+        ]
         with torch.no_grad():
             vectors = model.encode(chunk_texts, batch_size=16, show_progress_bar=True)
 
