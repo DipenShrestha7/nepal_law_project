@@ -7,6 +7,7 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from dotenv import load_dotenv
+from chatbot.retrieval_utils import embedding_text
 
 load_dotenv()
 PDF_PATH = "data/raw_pdfs/en/constitution.pdf"
@@ -146,7 +147,7 @@ def ingest_to_qdrant(documents: list[dict]):
 
     for doc in tqdm(documents):
         # Generate 1024-dimension embedding
-        vector = embedder.encode(doc["content_text"]).tolist()
+        vector = embedder.encode(embedding_text(doc, doc["content_text"])).tolist()
 
         # Prepare Qdrant Point
         point_id = str(uuid.uuid4())

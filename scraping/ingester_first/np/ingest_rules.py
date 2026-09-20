@@ -31,6 +31,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+from chatbot.retrieval_utils import embedding_text
 
 torch.set_num_threads(1)
 
@@ -301,7 +302,10 @@ def ingest_all_rules_and_regulations():
         )
 
         # Cap chunk length at 2500 characters to prevent PyTorch memory spikes
-        chunk_texts = [c["content_text"][:2500] for c in doc_chunks]
+        chunk_texts = [
+            embedding_text({"act_title": doc_title, **c}, c["content_text"][:2500])
+            for c in doc_chunks
+        ]
 
         # Safe batch inference with PyTorch gradient tracking completely turned off
         with torch.no_grad():

@@ -14,11 +14,17 @@ from langgraph.graph import END, StateGraph
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 from prompt.legal_system_prompt import LEGAL_SYSTEM_PROMPT
+
+try:
+    from .retrieval_utils import metadata_header
+except ImportError:
+    from retrieval_utils import metadata_header
 from config import (
     QDRANT_URL,
     QDRANT_API_KEY,
     OPENROUTER_API_KEY,
     COLLECTION_NAME,
+    FALLBACK_SCORE_THRESHOLD,
     SCORE_THRESHOLD,
 )
 
@@ -39,6 +45,32 @@ llm = ChatOpenAI(
 COLLECTIONS = (
     list(COLLECTION_NAME) if isinstance(COLLECTION_NAME, list) else [COLLECTION_NAME]
 )
+
+EXCLUDED_TITLE_MARKERS = (
+    "repealed",
+    "expired ordinance",
+    "लोप",
+    "खारेज",
+    "पुरानो ऐन",
+    "अध्यादेश (समाप्त)",
+)
+_reranker = None
+_reranker_loaded = False
+
+
+def get_reranker():
+    global _reranker, _reranker_loaded
+    if _reranker_loaded:
+        return _reranker
+    _reranker_loaded = True
+    try:
+        from sentence_transformers import CrossEncoder
+
+        _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    except Exception:
+        _reranker = None
+    return _reranker
+
 
 LEGAL_TERM_CORRECTIONS = {
     "जुर्माना": "जरिबाना",
@@ -162,6 +194,7 @@ class LegalGraphState(TypedDict):
     question: str
     search_query: str
     search_queries: List[str]
+    hyde_query: str
     article_number: int | None
     documents: List[Dict[str, Any]]
     context_str: str
@@ -244,9 +277,28 @@ def clean_llm_output(text: str) -> str:
     return re.sub(r"^User Safety:\s*\w+\s*", "", text, flags=re.IGNORECASE).strip()
 
 
+def find_title_matches(
+    question: str, records: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Ranks in-memory title records for deterministic exact-title retrieval."""
+    ranked = []
+    for record in records:
+        title = (
+            record.get("act_title")
+            or record.get("title_np")
+            or record.get("title")
+            or ""
+        )
+        score = score_act_title_match(question, str(title))
+        if score > 0:
+            ranked.append((score, record))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [record for _, record in ranked]
+
+
 # GRAPH NODES
 def prepare_query_node(state: LegalGraphState) -> Dict[str, Any]:
-    """Expands a fact pattern into several English and Nepali legal searches."""
+    """Uses one bounded HyDE call to turn facts into formal retrieval concepts."""
     user_query = state["question"].strip()
     article_number = extract_article_number(user_query)
 
@@ -262,7 +314,8 @@ question such as water-resource allocation, hydropower, irrigation licensing, or
 environmental management. Do not let the name of a physical object alone determine
 the legal domain.
 
-Return 6 to 10 short search queries, one per line, with no numbering or explanation.
+    Return exactly 3 to 5 short formal legal concepts, one per line, with no numbering or explanation.
+    These are hypothetical statutory concepts for retrieval, not conclusions about liability.
 Include:
 - the original facts in concise English;
 - possible legal concepts in English;
@@ -273,12 +326,23 @@ Include:
 - for public physical-conduct incidents, consider statutory concepts such as offensive
     substances, indecent behavior, nuisance, insult or humiliation, tort liability,
     emotional distress, compensation, and local judicial dispute resolution when the facts fit.
+- when the facts describe one private person directing offensive conduct at another,
+    generate targeted searches for the Muluki Criminal Code, 2074 and its indecent-
+    behavior/offensive-substance provisions; the Muluki Civil Code, 2074 and its
+    tort, emotional-distress, and compensation provisions; and the Local Government
+    Operation Act, 2074 and Judicial Committee/local nuisance jurisdiction. Do not
+    assume a specific section number; discover candidate provisions from the indexed
+    legal data and verify them against the retrieved context.
+- do not make constitutional writs, the Supreme Court, or extraordinary remedies a
+    default search for a private neighborhood incident unless the facts involve state
+    action or the user expressly asks about constitutional jurisdiction.
 
 USER QUESTION:
 {user_query}
 """.strip()
 
     search_queries = [user_query]
+    hyde_concepts = []
     try:
         expansion = str(llm.invoke(expansion_prompt).content)
         for line in expansion.splitlines():
@@ -288,7 +352,9 @@ USER QUESTION:
                 and query.lower() != user_query.lower()
                 and query not in search_queries
             ):
-                search_queries.append(query)
+                hyde_concepts.append(query)
+            hyde_concepts = hyde_concepts[:5]
+            search_queries.extend(hyde_concepts)
     except Exception:
         pass
 
@@ -299,6 +365,7 @@ USER QUESTION:
     return {
         "search_query": search_query,
         "search_queries": search_queries,
+        "hyde_query": " | ".join(hyde_concepts),
         "article_number": article_number,
     }
 
@@ -340,6 +407,7 @@ def extract_payload_metadata(point) -> Dict[str, Any]:
         or payload.get("chunk_text")
         or ""
     )
+    parent_content = payload.get("parent_content_text") or payload.get("parent_text")
 
     # 5. Section / Chunk Title
     title = payload.get("title") or payload.get("doc_type") or ""
@@ -351,6 +419,8 @@ def extract_payload_metadata(point) -> Dict[str, Any]:
         "article_number": article_number,
         "title": title,
         "content_text": content_text,
+        "parent_content_text": parent_content,
+        "metadata_header": metadata_header(payload),
         "score": getattr(point, "score", 1.0),
     }
 
@@ -358,6 +428,8 @@ def extract_payload_metadata(point) -> Dict[str, Any]:
 def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
     question = state["search_query"]
     search_queries = state.get("search_queries") or [question]
+    if state["question"] not in search_queries:
+        search_queries.insert(0, state["question"])
     article_number = state.get("article_number")
 
     search_results = []
@@ -365,8 +437,7 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
         title_matches = collect_act_title_matches(state["question"], COLLECTIONS)
         if title_matches:
             for collection_name, record, title_score in title_matches:
-                record.score = title_score
-                search_results.append((collection_name, record))
+                search_results.append((collection_name, record, title_score))
 
     if not search_results:
         for collection_name in COLLECTIONS:
@@ -392,7 +463,7 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
                             payload.get("doc_type") == "article"
                             and payload.get("article_number") == article_number
                         ):
-                            search_results.append((collection_name, record))
+                            search_results.append((collection_name, record, 1.0))
 
                     if next_offset is None:
                         break
@@ -411,39 +482,76 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
                     collection_name=collection_name,
                     query=query_vector,
                     using=vector_name,
-                    limit=8,
+                    limit=20,
                 ).points
-                search_results.extend((collection_name, point) for point in points)
+                for point in points:
+                    search_results.append(
+                        (collection_name, point, getattr(point, "score", 1.0))
+                    )
 
-    search_results.sort(
-        key=lambda item: getattr(item[1], "score", 1.0),
-        reverse=True,
-    )
+    search_results.sort(key=lambda item: item[2], reverse=True)
 
-    docs = []
-    seen_documents = set()
-    for collection_name, point in search_results:
-        if getattr(point, "score", 1.0) < SCORE_THRESHOLD:
-            continue
+    # Optional cross-encoder reranking keeps deployments without the model usable.
+    try:
+        reranker = get_reranker()
+        if reranker is None:
+            raise RuntimeError("Cross-encoder is unavailable")
+        candidates = search_results[:20]
+        pairs = [
+            (state["question"], extract_payload_metadata(point)["content_text"])
+            for _, point, _ in candidates
+        ]
+        scores = reranker.predict(pairs)
+        search_results[: len(candidates)] = [
+            item
+            for item, _ in sorted(
+                zip(candidates, scores), key=lambda pair: float(pair[1]), reverse=True
+            )
+        ]
+    except Exception:
+        pass
 
-        # Extract normalized metadata fields regardless of schema differences
-        chunk_data = extract_payload_metadata(point)
-        payload = point.payload or {}
-        document_key = (
-            payload.get("file_name"),
-            payload.get("section_number")
-            or payload.get("rule_number")
-            or payload.get("article_number")
-            or payload.get("schedule_number"),
-            payload.get("doc_type"),
-        )
-        if document_key in seen_documents:
-            continue
-        seen_documents.add(document_key)
-        chunk_data["collection_name"] = collection_name
-        docs.append(chunk_data)
-        if len(docs) >= 12:
-            break
+    def collect_documents(minimum_score: float) -> List[Dict[str, Any]]:
+        documents = []
+        seen_documents = set()
+        for collection_name, point, point_score in search_results:
+            if point_score < minimum_score:
+                continue
+
+            # Extract normalized metadata fields regardless of schema differences
+            chunk_data = extract_payload_metadata(point)
+            payload = point.payload or {}
+            title_for_filter = " ".join(
+                str(payload.get(key) or "")
+                for key in ("act_title", "title_np", "title", "file_name")
+            ).lower()
+            if any(marker in title_for_filter for marker in EXCLUDED_TITLE_MARKERS):
+                continue
+            document_key = (
+                collection_name,
+                payload.get("file_name"),
+                payload.get("section_number")
+                or payload.get("rule_number")
+                or payload.get("article_number")
+                or payload.get("schedule_number")
+                or payload.get("title"),
+                payload.get("doc_type"),
+            )
+            if document_key in seen_documents:
+                continue
+            seen_documents.add(document_key)
+            chunk_data["collection_name"] = collection_name
+            documents.append(chunk_data)
+            if len(documents) >= 12:
+                break
+        return documents
+
+    docs = collect_documents(SCORE_THRESHOLD)
+    if not docs:
+        # Broad fact patterns can have lower cosine scores than exact legal terms.
+        # Keep a small candidate set so the grounded LLM can judge relevance instead
+        # of converting a retrieval miss into a false "no data" response.
+        docs = collect_documents(FALLBACK_SCORE_THRESHOLD)
 
     return {"documents": docs}
 
@@ -458,10 +566,12 @@ def format_context_node(state: LegalGraphState) -> Dict[str, Any]:
     formatted_blocks = []
     for idx, c in enumerate(docs, start=1):
         # Run active character/matra cleaning pass on retrieved text
-        clean_text = preprocess_devanagari_text(c["content_text"])
+        clean_text = preprocess_devanagari_text(
+            c.get("parent_content_text") or c["content_text"]
+        )
 
         block = (
-            f"[{idx}] Collection: {c['collection_name']} | Law: {c['act_title']} | "
+            f"[{idx}] {c['metadata_header']} | Collection: {c['collection_name']} | Law: {c['act_title']} | "
             f"Chapter: {c['chapter']} | Article: {c['article_number'] or 'N/A'} | "
             f"Section/Rule: {c['section_number']}\n"
             f"Title: {c['title']}\n"
@@ -558,6 +668,7 @@ if __name__ == "__main__":
                 "search_queries": [],
                 "article_number": None,
                 "documents": [],
+                "hyde_query": "",
                 "context_str": "",
                 "answer": "",
             }

@@ -30,6 +30,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+from chatbot.retrieval_utils import embedding_text
 
 torch.set_num_threads(1)
 load_dotenv()
@@ -247,7 +248,10 @@ def ingest_all_large_codes():
         doc_chunks = parse_code_sections(raw_text)
         print(f"Extracted {len(doc_chunks)} section chunks. Vectorizing...")
 
-        chunk_texts = [c["content_text"][:2500] for c in doc_chunks]
+        chunk_texts = [
+            embedding_text({"act_title": doc_title, **c}, c["content_text"][:2500])
+            for c in doc_chunks
+        ]
 
         with torch.no_grad():
             vectors = model.encode(chunk_texts, batch_size=8, show_progress_bar=False)

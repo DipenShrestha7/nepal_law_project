@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
+from chatbot.retrieval_utils import embedding_text
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -147,7 +148,14 @@ def parse_economic_act(batch_pages: int = 10):
             if page_chunks:
                 texts = [c["content_text"] for c in page_chunks]
                 with torch.no_grad():
-                    vectors = model.encode(texts, batch_size=8, show_progress_bar=False)
+                    vectors = model.encode(
+                        [
+                            embedding_text({"act_title": doc_title, **chunk}, chunk["content_text"])
+                            for chunk in chunks
+                        ],
+                        batch_size=8,
+                        show_progress_bar=False,
+                    )
 
                 points = []
                 for idx, (chunk, vector) in enumerate(zip(page_chunks, vectors)):

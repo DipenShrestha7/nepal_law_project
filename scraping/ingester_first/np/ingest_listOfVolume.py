@@ -14,6 +14,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+from chatbot.retrieval_utils import embedding_text
 
 # Force UTF-8 output encoding for Windows terminals
 if hasattr(sys.stdout, "reconfigure"):
@@ -206,7 +207,9 @@ def parse_act_components(text: str) -> List[Dict[str, Any]]:
     main_text = text
     schedules_text = ""
     sched_split = re.split(
-        r"(\n\s*\*?\s*अनुसूची\s*-\s*[०-९\d]+|\n\s*\*?\s*अनुसूची\s*[:\n])", text, maxsplit=1
+        r"(\n\s*\*?\s*अनुसूची\s*-\s*[०-९\d]+|\n\s*\*?\s*अनुसूची\s*[:\n])",
+        text,
+        maxsplit=1,
     )
     if len(sched_split) > 1:
         main_text = sched_split[0]
@@ -319,7 +322,10 @@ def ingest_all_volume_wise_acts():
             f"\n[{volume_folder} -> {file_name}] Extracted {len(doc_chunks)} chunks. Vectorizing..."
         )
 
-        chunk_texts = [c["content_text"] for c in doc_chunks]
+        chunk_texts = [
+            embedding_text({"act_title": doc_title, **c}, c["content_text"])
+            for c in doc_chunks
+        ]
         with torch.no_grad():
             vectors = model.encode(chunk_texts, batch_size=16, show_progress_bar=True)
 

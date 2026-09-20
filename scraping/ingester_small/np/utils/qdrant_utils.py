@@ -2,6 +2,7 @@ from typing import Dict, Any
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
+from chatbot.retrieval_utils import embedding_text
 
 # Initialize embedding model once
 model = SentenceTransformer("BAAI/bge-m3")
@@ -13,7 +14,7 @@ def build_point(point_id: int, text: str, payload_data: Dict[str, Any]) -> Point
     clean_payload = {k: v for k, v in payload_data.items() if v is not None}
     clean_payload["content_text"] = text
 
-    vector = model.encode(text, show_progress_bar=False).tolist()
+    vector = model.encode(embedding_text(clean_payload, text), show_progress_bar=False).tolist()
 
     return PointStruct(id=point_id, vector=vector, payload=clean_payload)
 

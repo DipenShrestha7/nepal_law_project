@@ -1,0 +1,62 @@
+[
+  {
+    "file_name": "Domestic Violence (Offence and Punishment) Act, 2066 (2009).pdf",
+    "total_chunks": 22,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:08:49.922456+00:00"
+  },
+  {
+    "file_name": "Right to Information Act 2007.pdf",
+    "total_chunks": 41,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:16:11.574470+00:00"
+  },
+  {
+    "file_name": "Electronic Transaction Act 2063.pdf",
+    "total_chunks": 90,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:17:17.847260+00:00"
+  },
+  {
+    "file_name": "foreign_employment_act.pdf",
+    "total_chunks": 101,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:18:33.040349+00:00"
+  },
+  {
+    "file_name": "nepal-local-governance-act.pdf",
+    "total_chunks": 252,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:23:29.745573+00:00"
+  },
+  {
+    "file_name": "Vehicles and Transport Management Act, 2049.pdf",
+    "total_chunks": 319,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:28:18.799791+00:00"
+  },
+  {
+    "file_name": "The-Labour-Act-2017.pdf",
+    "total_chunks": 221,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:31:53.665118+00:00"
+  },
+  {
+    "file_name": "national_criminal_code.pdf",
+    "total_chunks": 359,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:36:56.526580+00:00"
+  },
+  {
+    "file_name": "criminal_procedure_code.pdf",
+    "total_chunks": 657,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:47:58.701002+00:00"
+  },
+  {
+    "file_name": "national_civil_procedure_code.pdf",
+    "total_chunks": 813,
+    "status": "success",
+    "ingested_at": "2026-09-19T17:59:24.373751+00:00"
+  }
+]

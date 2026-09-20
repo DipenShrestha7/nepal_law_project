@@ -10,6 +10,7 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 from tqdm import tqdm
+from chatbot.retrieval_utils import embedding_text
 
 load_dotenv()
 
@@ -242,7 +243,10 @@ def ingest_all_formation_orders():
         print(f"\n[{file_name}] Extracted {len(doc_chunks)} chunks. Vectorizing...")
 
         # Fast Batch Encoding (32 items per tensor operation)
-        chunk_texts = [c["content_text"] for c in doc_chunks]
+        chunk_texts = [
+            embedding_text({"act_title": order_title, **c}, c["content_text"])
+            for c in doc_chunks
+        ]
         vectors = model.encode(chunk_texts, batch_size=32, show_progress_bar=True)
 
         file_points = []
