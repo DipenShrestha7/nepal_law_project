@@ -13,12 +13,17 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
+
+# pyrefly: ignore [missing-import]
 from prompt.legal_system_prompt import LEGAL_SYSTEM_PROMPT
 
 try:
     from .retrieval_utils import metadata_header
 except ImportError:
+    # pyrefly: ignore [missing-import]
     from retrieval_utils import metadata_header
+
+# pyrefly: ignore [missing-import]
 from config import (
     QDRANT_URL,
     QDRANT_API_KEY,
@@ -84,7 +89,7 @@ def normalize_legal_search_text(value: str) -> str:
     if value is None:
         return ""
 
-    text = unicodedata.normalize("NFC", str(value)).lower()
+    text = unicodedata.normalize("NFC", value).lower()
     text = text.replace("–", "-").replace("—", "-")
     text = text.replace("&", " and ")
     text = re.sub(r"[\u2018\u2019]", "'", text)
@@ -626,7 +631,7 @@ def sanitize_legal_output_node(state: LegalGraphState) -> Dict[str, Any]:
 
 # WORKFLOW BUILDER
 def build_legal_rag_graph():
-    workflow = StateGraph(LegalGraphState)
+    workflow = StateGraph(LegalGraphState)  # pyrefly: ignore [bad-specialization]
 
     # 1. Add nodes
     workflow.add_node("prepare_query", prepare_query_node)
