@@ -14,12 +14,18 @@ PDF_PATH = "data/raw_pdfs/en/constitution.pdf"
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = "nepal_laws"
+QDRANT_TIMEOUT = int(os.getenv("QDRANT_TIMEOUT", "120"))
+QDRANT_BATCH_SIZE = 32
 
 # Initialize BGE-M3 Embedding Model (1024 dimensions)
 print("Loading BAAI/bge-m3 embedding model...")
 embedder = SentenceTransformer("BAAI/bge-m3")
 
-qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+qdrant = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY,
+    timeout=QDRANT_TIMEOUT,
+)
 
 # PARSING PDF TEXT
 
@@ -163,9 +169,18 @@ def ingest_to_qdrant(documents: list[dict]):
 
         points.append(PointStruct(id=point_id, vector=vector, payload=payload))
 
-    # Batch upsert points to Qdrant Cloud
-    print(f"Upserting {len(points)} points to Qdrant Cloud...")
-    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+    # Batch upsert points to Qdrant Cloud to avoid write timeouts while
+    # uploading large vectors and payloads in one request.
+    print(
+        f"Upserting {len(points)} points to Qdrant Cloud in batches of {QDRANT_BATCH_SIZE}..."
+    )
+    for batch_start in range(0, len(points), QDRANT_BATCH_SIZE):
+        batch = points[batch_start : batch_start + QDRANT_BATCH_SIZE]
+        qdrant.upsert(
+            collection_name=COLLECTION_NAME,
+            points=batch,
+            timeout=QDRANT_TIMEOUT,
+        )
     print("Ingestion complete successfully!")
 
 

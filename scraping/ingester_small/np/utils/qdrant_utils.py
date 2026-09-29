@@ -14,12 +14,27 @@ def build_point(point_id: int, text: str, payload_data: Dict[str, Any]) -> Point
     clean_payload = {k: v for k, v in payload_data.items() if v is not None}
     clean_payload["content_text"] = text
 
-    vector = model.encode(embedding_text(clean_payload, text), show_progress_bar=False).tolist()
+    vector = model.encode(
+        embedding_text(clean_payload, text), show_progress_bar=False
+    ).tolist()
 
     return PointStruct(id=point_id, vector=vector, payload=clean_payload)
 
 
-def push_to_qdrant(client: QdrantClient, collection_name: str, points: list):
-    """Uploads batch points to Qdrant."""
-    if points:
-        client.upsert(collection_name=collection_name, points=points)
+def push_to_qdrant(
+    client: QdrantClient,
+    collection_name: str,
+    points: list,
+    batch_size: int = 32,
+    timeout: int | None = None,
+):
+    """Uploads batch points to Qdrant without sending a huge single payload."""
+    if not points:
+        return
+
+    for batch_start in range(0, len(points), batch_size):
+        batch = points[batch_start : batch_start + batch_size]
+        kwargs = {"collection_name": collection_name, "points": batch}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        client.upsert(**kwargs)

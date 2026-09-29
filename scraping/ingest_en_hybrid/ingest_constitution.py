@@ -16,6 +16,8 @@ QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = "nepal_laws_en_hybrid"
 CONSTITUTION_ACT_TITLE = "Constitution of Nepal"
+QDRANT_TIMEOUT = int(os.getenv("QDRANT_TIMEOUT", "120"))
+QDRANT_BATCH_SIZE = 32
 
 # Initialize BGE-M3 Embedding Model (1024 dimensions)
 print("Loading BAAI/bge-m3 embedding model...")
@@ -24,7 +26,11 @@ embedder = SentenceTransformer("BAAI/bge-m3")
 print("Loading BM25 sparse model...")
 sparse_embedder = SparseTextEmbedding(model_name="Qdrant/bm25")
 
-qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+qdrant = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY,
+    timeout=QDRANT_TIMEOUT,
+)
 
 
 def ensure_payload_indexes(collection_name: str):
@@ -119,9 +125,15 @@ def parse_constitution_structure(raw_text: str) -> list[dict]:
         )
     )
 
-    # Isolate text between article header positions
+    # Isolate text between article header positions, but keep only the first occurrence
+    # of each real article number. The PDF text can repeat the same numbering in
+    # table-of-contents / repeated headers, which creates inflated document counts.
+    unique_articles: dict[int, dict] = {}
     for idx, match in enumerate(article_matches):
         art_num = int(match.group(1))
+        if art_num in unique_articles:
+            continue
+
         art_title = match.group(2).strip()
 
         # Text starts at current match and ends at the next article match (or Schedules start)
@@ -138,27 +150,32 @@ def parse_constitution_structure(raw_text: str) -> list[dict]:
         art_content = raw_text[start_pos:end_pos].strip()
         art_content = re.sub(r"\s+", " ", art_content)  # Clean whitespace
 
-        documents.append(
-            {
-                "doc_type": "article",
-                "title": art_title,
-                "article_number": art_num,
-                "section_number": None,
-                "schedule_number": None,
-                "content_text": art_content,
-                "language": "en",
-            }
-        )
+        unique_articles[art_num] = {
+            "doc_type": "article",
+            "title": art_title,
+            "article_number": art_num,
+            "section_number": None,
+            "schedule_number": None,
+            "content_text": art_content,
+            "language": "en",
+        }
+
+    documents.extend(unique_articles.values())
 
     # 3. SCHEDULES (Schedules 3 to 9)
     schedule_matches = list(
-        re.finditer(r"\n\s*Schedule\s*[-–—\:]?\s*(\d{1,3})\b", raw_text, re.IGNORECASE)
+        re.finditer(
+            r"^[^\S\r\n]*[^\w\r\n]*Schedule\s*[-–—:]?\s*(\d{1,3})\s*$",
+            raw_text,
+            re.IGNORECASE | re.MULTILINE,
+        )
     )
 
+    unique_schedules: dict[int, dict] = {}
     for idx, match in enumerate(schedule_matches):
         sched_num = int(match.group(1))
-        if sched_num in [1, 2]:
-            continue  # Exclude diagram/image schedules
+        if sched_num in [1, 2] or sched_num in unique_schedules:
+            continue  # Exclude diagram/image schedules and repeated matches
 
         start_pos = match.start()
         end_pos = (
@@ -170,34 +187,38 @@ def parse_constitution_structure(raw_text: str) -> list[dict]:
         sched_content = raw_text[start_pos:end_pos].strip()
         sched_content = re.sub(r"\s+", " ", sched_content)
 
-        documents.append(
-            {
-                "doc_type": "schedule",
-                "title": f"Schedule {sched_num}",
-                "article_number": None,
-                "section_number": None,
-                "schedule_number": sched_num,
-                "content_text": sched_content,
-                "language": "en",
-            }
-        )
+        unique_schedules[sched_num] = {
+            "doc_type": "schedule",
+            "title": f"Schedule {sched_num}",
+            "article_number": None,
+            "section_number": None,
+            "schedule_number": sched_num,
+            "content_text": sched_content,
+            "language": "en",
+        }
+
+    documents.extend(unique_schedules.values())
 
     return documents
 
 
 # VECTOR DATABASE INGESTION
 def ingest_to_qdrant(documents: list[dict]):
+    if not documents:
+        print(
+            "No parsed documents to ingest; leaving existing Qdrant points unchanged."
+        )
+        return
+
     # 1. Recreate collection configured for HYBRID SEARCH
     if not qdrant.collection_exists(COLLECTION_NAME):
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config={
-                "text-dense": models.VectorParams(
-                    size=1024, distance=models.Distance.COSINE
-                )
+                "dense": models.VectorParams(size=1024, distance=models.Distance.COSINE)
             },
             sparse_vectors_config={
-                "text-sparse": models.SparseVectorParams(
+                "sparse": models.SparseVectorParams(
                     index=models.SparseIndexParams(on_disk=False)
                 )
             },
@@ -209,7 +230,8 @@ def ingest_to_qdrant(documents: list[dict]):
     points = []
     print(f"Generating dense & sparse vectors for {len(documents)} parsed chunks...")
 
-    for doc in tqdm(documents):
+    source_file = os.path.basename(PDF_PATH)
+    for doc_index, doc in enumerate(tqdm(documents)):
         text_to_embed = embedding_text_en(doc, doc["content_text"])
 
         # Generate 1024-dimension Dense Vector
@@ -219,10 +241,12 @@ def ingest_to_qdrant(documents: list[dict]):
         sparse_vec_obj = list(sparse_embedder.embed([text_to_embed]))[0]
 
         # Prepare Payload
-        point_id = str(uuid.uuid4())
+        point_id = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"{source_file}:constitution:{doc_index}")
+        )
         payload = {
             "act_title": CONSTITUTION_ACT_TITLE,
-            "source_file": os.path.basename(PDF_PATH),
+            "source_file": source_file,
             "doc_type": doc["doc_type"],
             "title": doc["title"],
             "article_number": doc.get("article_number"),
@@ -237,8 +261,8 @@ def ingest_to_qdrant(documents: list[dict]):
             PointStruct(
                 id=point_id,
                 vector={
-                    "text-dense": dense_vector,
-                    "text-sparse": models.SparseVector(
+                    "dense": dense_vector,
+                    "sparse": models.SparseVector(
                         indices=sparse_vec_obj.indices.tolist(),
                         values=sparse_vec_obj.values.tolist(),
                     ),
@@ -247,9 +271,40 @@ def ingest_to_qdrant(documents: list[dict]):
             )
         )
 
-    # Batch upsert points to Qdrant Cloud
-    print(f"Upserting {len(points)} hybrid points to Qdrant Cloud...")
-    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+    # Batch upsert points to Qdrant Cloud so large payloads do not hit the
+    # write-timeout when a single upload is too large.
+    print(
+        f"Upserting {len(points)} hybrid points to Qdrant Cloud in batches of {QDRANT_BATCH_SIZE}..."
+    )
+    for batch_start in range(0, len(points), QDRANT_BATCH_SIZE):
+        batch = points[batch_start : batch_start + QDRANT_BATCH_SIZE]
+        qdrant.upsert(
+            collection_name=COLLECTION_NAME,
+            points=batch,
+            timeout=QDRANT_TIMEOUT,
+        )
+
+    point_ids = [point.id for point in points]
+    qdrant.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="act_title",
+                        match=models.MatchValue(value=CONSTITUTION_ACT_TITLE),
+                    ),
+                    models.FieldCondition(
+                        key="source_file",
+                        match=models.MatchValue(value=source_file),
+                    ),
+                ],
+                must_not=[models.HasIdCondition(has_id=point_ids)],
+            )
+        ),
+        wait=True,
+        timeout=QDRANT_TIMEOUT,
+    )
     print("Ingestion complete successfully with Hybrid Search setup!")
 
 

@@ -14,12 +14,18 @@ PDF_PATH = "data/raw_pdfs/en/constitution.pdf"
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = "nepal_laws_en"
+QDRANT_TIMEOUT = int(os.getenv("QDRANT_TIMEOUT", "120"))
+QDRANT_BATCH_SIZE = 32
 
 # Initialize BGE-M3 Embedding Model (1024 dimensions)
 print("Loading BAAI/bge-m3 embedding model...")
 embedder = SentenceTransformer("BAAI/bge-m3")
 
-qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+qdrant = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY,
+    timeout=QDRANT_TIMEOUT,
+)
 
 # PARSING PDF TEXT
 
@@ -85,10 +91,17 @@ def parse_constitution_structure(raw_text: str) -> list[dict]:
     article_pattern = r"(?=\n\s*(\d{1,3})\.\s+([A-Z][A-Za-z0-9\s,\-\(\)]+):)"
     parts = re.split(article_pattern, raw_text)
 
+    seen_articles: set[int] = set()
+
     # Process split groups (article_number, title, content)
     i = 1
     while i < len(parts):
-        art_num = parts[i].strip()
+        art_num = int(parts[i].strip())
+        if art_num in seen_articles:
+            i += 3
+            continue
+        seen_articles.add(art_num)
+
         art_title = parts[i + 1].strip()
         art_content = parts[i + 2].strip() if (i + 2) < len(parts) else ""
 
@@ -100,13 +113,13 @@ def parse_constitution_structure(raw_text: str) -> list[dict]:
             art_content = art_content[: next_boundary.start()].strip()
 
         # Clean excess spaces and strip duplicated article header present in the raw text
-        clean_content = normalize_article_content(art_num, art_title, art_content)
+        clean_content = normalize_article_content(str(art_num), art_title, art_content)
 
         documents.append(
             {
                 "doc_type": "article",
                 "title": art_title,
-                "article_number": int(art_num),
+                "article_number": art_num,
                 "schedule_number": None,
                 "content_text": clean_content,
                 "language": "en",
@@ -115,6 +128,7 @@ def parse_constitution_structure(raw_text: str) -> list[dict]:
         i += 3
 
     # SCHEDULES EXTRACTION (Only Schedules 3 through 9)
+    seen_schedules: set[int] = set()
     schedule_splits = re.split(r"(?=Schedule\s*-\s*\d+)", raw_text, flags=re.IGNORECASE)
     for sched_text in schedule_splits:
         match = re.search(r"Schedule\s*-\s*(\d+)", sched_text, re.IGNORECASE)
@@ -122,11 +136,12 @@ def parse_constitution_structure(raw_text: str) -> list[dict]:
             sched_num = int(match.group(1))
 
             # Explicitly EXCLUDE Schedule 1 (National Flag) and Schedule 2 (Coat of Arms)
-            if sched_num in [1, 2]:
+            if sched_num in [1, 2] or sched_num in seen_schedules:
                 print(
-                    f"Skipping Schedule-{sched_num} (Diagram / Image asset excluded)."
+                    f"Skipping Schedule-{sched_num} (Diagram / Image asset excluded or duplicate)."
                 )
                 continue
+            seen_schedules.add(sched_num)
 
             # Extract title line
             lines = sched_text.strip().splitlines()
@@ -177,9 +192,18 @@ def ingest_to_qdrant(documents: list[dict]):
 
         points.append(PointStruct(id=point_id, vector=vector, payload=payload))
 
-    # Batch upsert points to Qdrant Cloud
-    print(f"Upserting {len(points)} points to Qdrant Cloud...")
-    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+    # Batch upsert points to Qdrant Cloud to avoid write timeouts while
+    # uploading large vectors and payloads in one request.
+    print(
+        f"Upserting {len(points)} points to Qdrant Cloud in batches of {QDRANT_BATCH_SIZE}..."
+    )
+    for batch_start in range(0, len(points), QDRANT_BATCH_SIZE):
+        batch = points[batch_start : batch_start + QDRANT_BATCH_SIZE]
+        qdrant.upsert(
+            collection_name=COLLECTION_NAME,
+            points=batch,
+            timeout=QDRANT_TIMEOUT,
+        )
     print("Ingestion complete successfully!")
 
 

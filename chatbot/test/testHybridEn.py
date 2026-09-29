@@ -12,8 +12,9 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
+from fastembed import SparseTextEmbedding
 
 try:
     from .retrieval_utils import metadata_header
@@ -25,26 +26,14 @@ from config import (
     QDRANT_URL,
     QDRANT_API_KEY,
     OPENROUTER_API_KEY,
-    COLLECTION_NAME,
     FALLBACK_SCORE_THRESHOLD,
     SCORE_THRESHOLD,
 )
 
 # pyrefly: ignore [missing-import]
-from prompt.legal_system_prompt import LEGAL_SYSTEM_PROMPT
+from prompt.legal_system_prompt import LEGAL_SYSTEM_PROMPT_EN
 
 load_dotenv()
-
-
-def get_collection_names() -> List[str]:
-    raw = COLLECTION_NAME
-    names = list(raw) if isinstance(raw, list) else [raw]
-    english_names = [
-        name
-        for name in names
-        if "en" in str(name).lower() or "english" in str(name).lower()
-    ]
-    return english_names or ["nepal_laws_en"]
 
 
 def is_english_chunk(value: Any) -> bool:
@@ -62,6 +51,7 @@ def is_english_chunk(value: Any) -> bool:
 
 
 embedder = SentenceTransformer("BAAI/bge-m3")
+sparse_embedder = SparseTextEmbedding(model_name="Qdrant/bm25")
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
 
 llm = ChatOpenAI(
@@ -75,13 +65,17 @@ llm = ChatOpenAI(
     },
 )
 
-COLLECTIONS = get_collection_names()
+COLLECTIONS = ["nepal_laws_en_hybrid"]
+MAX_SCHEDULE_CONTEXT_CHARS = 12000
 
 
 class StatutoryAnchors(TypedDict):
     article_number: Optional[int]
     section_number: Optional[int]
     schedule_number: Optional[int]
+    article_numbers: List[int]
+    section_numbers: List[int]
+    schedule_numbers: List[int]
     target_act: Optional[str]
     is_constitutional_schedule_query: bool
 
@@ -103,32 +97,42 @@ def extract_statutory_anchors(query: str) -> StatutoryAnchors:
     text = unicodedata.normalize("NFC", query).strip()
 
     # Article Anchor (e.g. Article 27, Art. 27, 27th Article)
-    art_match = re.search(
-        r"\b(?:article|art\.?)\s*(?:no\.?|number)?\s*[-:]?\s*(\d{1,3})\b",
-        text,
-        re.IGNORECASE,
-    )
-    article_num = int(art_match.group(1)) if art_match else None
+    article_numbers = [
+        int(number)
+        for match in re.finditer(
+            r"\b(?:articles?|art\.?)\s*(?:no\.?|number)?\s*[-:]?\s*(\d{1,3}(?:\s*(?:/|,|and)\s*(?:articles?|art\.?)?\s*\d{1,3})*)",
+            text,
+            re.IGNORECASE,
+        )
+        for number in re.findall(r"\d{1,3}", match.group(1))
+    ]
+    article_num = article_numbers[0] if article_numbers else None
 
     # Section Anchor (e.g. Section 305, Sec 11, Section No. 11)
-    sec_match = re.search(
-        r"\b(?:section|sec\.?)\s*(?:no\.?|number)?\s*[-:]?\s*(\d{1,3})\b",
-        text,
-        re.IGNORECASE,
-    )
-    section_num = int(sec_match.group(1)) if sec_match else None
+    section_numbers = [
+        int(match.group(1))
+        for match in re.finditer(
+            r"\b(?:section|sec\.?)\s*(?:no\.?|number)?\s*[-:]?\s*(\d{1,3})\b",
+            text,
+            re.IGNORECASE,
+        )
+    ]
+    section_num = section_numbers[0] if section_numbers else None
 
     # Schedule Anchor (Flexible regex: Schedule 8, SCHEDULE-8, Schedule 8:, Schedule No. 8)
-    sched_match = re.search(
-        r"\b(?:schedule|sched\.?)\s*(?:[-–—:]|no\.?|number)?\s*(\d{1,2})\b",
-        text,
-        re.IGNORECASE,
-    )
-    schedule_num = int(sched_match.group(1)) if sched_match else None
+    schedule_numbers = [
+        int(match.group(1))
+        for match in re.finditer(
+            r"\b(?:schedule|sched\.?)\s*(?:[-–—:]|no\.?|number)?\s*(\d{1,2})\b",
+            text,
+            re.IGNORECASE,
+        )
+    ]
+    schedule_num = schedule_numbers[0] if schedule_numbers else None
 
     # Detect if query asks how constitutional schedules (5, 6, 7, 8, 9) are operationalized in enabling acts
     is_const_sched = bool(
-        schedule_num in [5, 6, 7, 8, 9]
+        any(number in [5, 6, 7, 8, 9] for number in schedule_numbers)
         and re.search(
             r"\b(?:operational|implement|local government|act|enabl|power|function|duty)\b",
             text,
@@ -157,6 +161,9 @@ def extract_statutory_anchors(query: str) -> StatutoryAnchors:
         "article_number": article_num,
         "section_number": section_num,
         "schedule_number": schedule_num,
+        "article_numbers": article_numbers,
+        "section_numbers": section_numbers,
+        "schedule_numbers": schedule_numbers,
         "target_act": target_act,
         "is_constitutional_schedule_query": is_const_sched,
     }
@@ -292,91 +299,74 @@ def extract_payload_metadata(point) -> Dict[str, Any]:
     }
 
 
+def build_query_filter(anchors: StatutoryAnchors):
+    required_conditions = [
+        models.FieldCondition(key="language", match=models.MatchValue(value="en"))
+    ]
+    anchor_conditions = []
+
+    if anchors.get("target_act") == "Constitution":
+        required_conditions.append(
+            models.FieldCondition(
+                key="act_title",
+                match=models.MatchValue(value="Constitution of Nepal"),
+            )
+        )
+
+    for field_name, plural_name in (
+        ("article_number", "article_numbers"),
+        ("section_number", "section_numbers"),
+        ("schedule_number", "schedule_numbers"),
+    ):
+        values = anchors.get(plural_name) or []
+        if not values and anchors.get(field_name) is not None:
+            values = [anchors[field_name]]
+        if values:
+            anchor_conditions.append(
+                models.FieldCondition(key=field_name, match=models.MatchAny(any=values))
+            )
+
+    return models.Filter(
+        must=required_conditions,
+        should=anchor_conditions or None,
+    )
+
+
 def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
     anchors = state.get("anchors") or extract_statutory_anchors(state["question"])
     search_queries = state.get("search_queries") or [state["question"]]
     collected_results = []
     seen_keys: Set[Tuple[str, Any, Any, Any]] = set()
 
-    # Step A: Exact Statutory Anchor Retrieval (solves Problem 4 & handles ingested variations)
+    # Filter in Qdrant so its payload indexes can narrow the hybrid search.
+    query_filter = build_query_filter(anchors)
+
     for collection_name in COLLECTIONS:
         if not qdrant.collection_exists(collection_name):
             continue
-
-        if (
-            anchors.get("article_number") is not None
-            or anchors.get("section_number") is not None
-            or anchors.get("schedule_number") is not None
-        ):
-            offset = None
-            while True:
-                records, next_offset = qdrant.scroll(
-                    collection_name=collection_name,
-                    limit=100,
-                    offset=offset,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-                for record in records:
-                    payload = record.payload or {}
-                    matched_anchor = False
-
-                    # Article exact match
-                    if anchors.get("article_number") is not None:
-                        if (
-                            payload.get("doc_type") == "article"
-                            and payload.get("article_number")
-                            == anchors["article_number"]
-                        ):
-                            matched_anchor = True
-
-                    # Section exact match
-                    if anchors.get("section_number") is not None:
-                        rec_sec = payload.get("section_number")
-                        if str(rec_sec) == str(anchors["section_number"]):
-                            matched_anchor = True
-
-                    # Schedule exact match with dynamic retrieval-time text check
-                    if anchors.get("schedule_number") is not None:
-                        target_sched = anchors["schedule_number"]
-                        rec_sched = payload.get("schedule_number")
-                        if rec_sched is not None and str(rec_sched) == str(target_sched):
-                            matched_anchor = True
-                        else:
-                            # Dynamic retrieval-time check on title and content_text
-                            sched_regex = rf"(?i)\b(?:SCHEDULE|Schedule|sched\.?)\s*(?:[-–—:]|no\.?|number)?\s*{target_sched}\b"
-                            candidate_sample = f"{payload.get('title') or ''} {str(payload.get('content_text') or '')[:350]}"
-                            if re.search(sched_regex, candidate_sample):
-                                matched_anchor = True
-
-                    if matched_anchor:
-                        collected_results.append(
-                            (collection_name, record, 2.5)
-                        )  # High priority boost
-
-                if next_offset is None or len(collected_results) >= 10:
-                    break
-                offset = next_offset
-
-    # Step B: Dense Vector Retrieval with Expanded Queries (solves Problem 1)
-    for collection_name in COLLECTIONS:
-        if not qdrant.collection_exists(collection_name):
-            continue
-
-        collection_info = qdrant.get_collection(collection_name)
-        configured_vectors = collection_info.config.params.vectors
-        vector_name = (
-            next(iter(configured_vectors))
-            if isinstance(configured_vectors, dict)
-            else None
-        )
 
         for search_text in search_queries:
-            query_vector = embedder.encode(search_text).tolist()
+            dense_vector = embedder.encode(search_text).tolist()
+            sparse_vector = next(iter(sparse_embedder.embed([search_text])))
             points = qdrant.query_points(
                 collection_name=collection_name,
-                query=query_vector,
-                using=vector_name,
+                prefetch=[
+                    models.Prefetch(
+                        query=dense_vector,
+                        using="dense",
+                        limit=15,
+                    ),
+                    models.Prefetch(
+                        query=models.SparseVector(
+                            indices=sparse_vector.indices.tolist(),
+                            values=sparse_vector.values.tolist(),
+                        ),
+                        using="sparse",
+                        limit=15,
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query_filter=query_filter,
                 limit=15,
             ).points
 
@@ -396,15 +386,31 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
             chunk_data["content_text"] or chunk_data["parent_content_text"] or ""
         )
 
+        if (
+            chunk_data.get("doc_type") == "schedule"
+            and len(content_text) > MAX_SCHEDULE_CONTEXT_CHARS
+        ):
+            print(
+                f"Skipping oversized malformed schedule payload from {collection_name}; "
+                "re-run constitution ingestion to refresh it."
+            )
+            continue
+
         if not is_english_chunk(content_text):
             continue
 
         # Problem 3 fix: If user asks how Constitutional Schedule powers are operationalized in an enabling Act,
         # suppress tail administrative schedules/forms of the Act in favor of substantive sections.
         if anchors.get("is_constitutional_schedule_query"):
-            doc_type = str(chunk_data.get("doc_type") or payload.get("doc_type") or "").lower()
-            act_title = str(chunk_data.get("act_title") or payload.get("act_title") or "").lower()
-            if "constitution" not in act_title and (doc_type == "schedule" or chunk_data.get("schedule_number") is not None):
+            doc_type = str(
+                chunk_data.get("doc_type") or payload.get("doc_type") or ""
+            ).lower()
+            act_title = str(
+                chunk_data.get("act_title") or payload.get("act_title") or ""
+            ).lower()
+            if "constitution" not in act_title and (
+                doc_type == "schedule" or chunk_data.get("schedule_number") is not None
+            ):
                 continue  # Suppress administrative forms / tail schedules of Acts
 
         doc_key = (
@@ -438,13 +444,20 @@ def format_context_node(state: LegalGraphState) -> Dict[str, Any]:
         clean_text = unicodedata.normalize(
             "NFC", doc.get("parent_content_text") or doc.get("content_text") or ""
         )
-        block = (
-            f"[{idx}] {doc['metadata_header']} | Law: {doc['act_title']} | "
-            f"Chapter/Part: {doc['chapter']} | Article: {doc['article_number'] or 'N/A'} | "
-            f"Section/Rule: {doc['section_number']} | Schedule: {doc['schedule_number'] or 'N/A'}\n"
-            f"Title: {doc['title']}\n"
-            f"Content: {clean_text}\n"
-        )
+        header_fields = [
+            f"Authority: {doc['act_title']}",
+            f"Document: {doc['title'] or doc['doc_type'] or 'Provision'}",
+        ]
+        if doc["article_number"] is not None:
+            header_fields.append(f"Article: {doc['article_number']}")
+        if doc["section_number"] != "N/A":
+            header_fields.append(f"Section: {doc['section_number']}")
+        if doc["schedule_number"] is not None:
+            header_fields.append(f"Schedule: {doc['schedule_number']}")
+        if doc["chapter"] != "N/A":
+            header_fields.append(f"Chapter/Part: {doc['chapter']}")
+
+        block = f"[{idx}] {' | '.join(header_fields)}\nContent: {clean_text}\n"
         blocks.append(block)
 
     return {"context_str": "\n\n".join(blocks)}
@@ -460,7 +473,7 @@ def generate_answer_node(state: LegalGraphState) -> Dict[str, Any]:
         }
 
     messages = [
-        SystemMessage(content=LEGAL_SYSTEM_PROMPT),
+        SystemMessage(content=LEGAL_SYSTEM_PROMPT_EN),
         HumanMessage(
             content=f"<context>\n{context}\n</context>\n\nUSER QUESTION: {question}"
         ),
@@ -469,6 +482,11 @@ def generate_answer_node(state: LegalGraphState) -> Dict[str, Any]:
     cleaned_answer = re.sub(
         r"^User Safety:\s*\w+\s*", "", str(response.content), flags=re.IGNORECASE
     ).strip()
+    if not cleaned_answer:
+        cleaned_answer = (
+            "I found relevant legal provisions, but the response service returned "
+            "no answer. Please try again."
+        )
     return {"answer": cleaned_answer}
 
 
@@ -509,6 +527,9 @@ if __name__ == "__main__":
                 "article_number": None,
                 "section_number": None,
                 "schedule_number": None,
+                "article_numbers": [],
+                "section_numbers": [],
+                "schedule_numbers": [],
                 "target_act": None,
                 "is_constitutional_schedule_query": False,
             },
