@@ -17,12 +17,12 @@ from sentence_transformers import SentenceTransformer
 from fastembed import SparseTextEmbedding
 
 try:
-    from .retrieval_utils import metadata_header
+    from chatbot.retrieval_utils_en import metadata_header
 except ImportError:
     # pyrefly: ignore [missing-import]
-    from retrieval_utils import metadata_header  #
+    from chatbot.retrieval_utils_en import metadata_header  #
 # pyrefly: ignore [missing-import]
-from config import (
+from chatbot.config import (
     QDRANT_URL,
     QDRANT_API_KEY,
     OPENROUTER_API_KEY,
@@ -31,7 +31,8 @@ from config import (
 )
 
 # pyrefly: ignore [missing-import]
-from prompt.legal_system_prompt import LEGAL_SYSTEM_PROMPT_EN
+from chatbot.prompt.legal_system_prompt import LEGAL_SYSTEM_PROMPT_EN
+from chatbot.models.model import StatutoryAnchors, LegalGraphState
 
 load_dotenv()
 
@@ -67,27 +68,6 @@ llm = ChatOpenAI(
 
 COLLECTIONS = ["nepal_laws_en_hybrid"]
 MAX_SCHEDULE_CONTEXT_CHARS = 12000
-
-
-class StatutoryAnchors(TypedDict):
-    article_number: Optional[int]
-    section_number: Optional[int]
-    schedule_number: Optional[int]
-    article_numbers: List[int]
-    section_numbers: List[int]
-    schedule_numbers: List[int]
-    target_act: Optional[str]
-    is_constitutional_schedule_query: bool
-
-
-class LegalGraphState(TypedDict):
-    question: str
-    search_query: str
-    search_queries: List[str]
-    anchors: StatutoryAnchors
-    documents: List[Dict[str, Any]]
-    context_str: str
-    answer: str
 
 
 # ==========================================
@@ -179,19 +159,19 @@ def prepare_query_node(state: LegalGraphState) -> Dict[str, Any]:
 
     # Cross-statute legal concept expansion prompt
     expansion_prompt = f"""
-You are a legal search query optimizer for Nepal Law (both Constitution, Specialized Acts like Electronic Transactions Act, Local Government Operation Act, and General Codes like National Penal Code / Muluki Criminal Code & Civil Code).
+                        You are a legal search query optimizer for Nepal Law (both Constitution, Specialized Acts like Electronic Transactions Act, Local Government Operation Act, and General Codes like National Penal Code / Muluki Criminal Code & Civil Code).
 
-User Question: {user_query}
+                        User Question: {user_query}
 
-Generate 3-4 targeted English legal retrieval queries to locate relevant statutory provisions.
-CRITICAL RULES:
-1. If the query uses modern cyber/tech terms (e.g. cyber-defamation, online harassment, computer fraud, online financial scam, doxxing):
-   - Query 1: Specialized terms in the Electronic Transactions Act, 2063 (e.g. computer source code, illegal access, data distortion).
-   - Query 2: Equivalent traditional penal offenses in the National Penal (Code) Act, 2074 (e.g. libel, slander, defamation, character assassination, Section 305, 306, 307; outraging modesty, insult to modesty, intimidation; cheating, personation, fraud, forgery).
-2. If the query asks about Constitutional Schedule powers (e.g. Schedule 8 local level powers) operationalized in an enabling Act (e.g. Local Government Operation Act):
-   - Include substantive section concepts: "powers, functions and duties of municipality rural municipality local level Section 11 Local Government Operation Act"
-3. Keep queries short, keyword-dense, and focused on statutory provisions. Output only the queries, one per line.
-""".strip()
+                        Generate 3-4 targeted English legal retrieval queries to locate relevant statutory provisions.
+                        CRITICAL RULES:
+                        1. If the query uses modern cyber/tech terms (e.g. cyber-defamation, online harassment, computer fraud, online financial scam, doxxing):
+                        - Query 1: Specialized terms in the Electronic Transactions Act, 2063 (e.g. computer source code, illegal access, data distortion).
+                        - Query 2: Equivalent traditional penal offenses in the National Penal (Code) Act, 2074 (e.g. libel, slander, defamation, character assassination, Section 305, 306, 307; outraging modesty, insult to modesty, intimidation; cheating, personation, fraud, forgery).
+                        2. If the query asks about Constitutional Schedule powers (e.g. Schedule 8 local level powers) operationalized in an enabling Act (e.g. Local Government Operation Act):
+                        - Include substantive section concepts: "powers, functions and duties of municipality rural municipality local level Section 11 Local Government Operation Act"
+                        3. Keep queries short, keyword-dense, and focused on statutory provisions. Output only the queries, one per line.
+                        """.strip()
 
     try:
         response = llm.invoke([HumanMessage(content=expansion_prompt)])
@@ -353,7 +333,7 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
                 prefetch=[
                     models.Prefetch(
                         query=dense_vector,
-                        using="dense",
+                        using="dense",  # Match your vector name ("dense" or "text-dense")
                         limit=15,
                     ),
                     models.Prefetch(
@@ -361,7 +341,7 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
                             indices=sparse_vector.indices.tolist(),
                             values=sparse_vector.values.tolist(),
                         ),
-                        using="sparse",
+                        using="sparse",  # Match your vector name ("sparse" or "text-sparse")
                         limit=15,
                     ),
                 ],
@@ -375,9 +355,12 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
                     (collection_name, point, getattr(point, "score", 1.0))
                 )
 
-    # Step C: Filtering & Structure-Aware Ranking (solves Problem 3)
+    # Step C: Filtering & Structure-Aware Ranking
     collected_results.sort(key=lambda item: item[2], reverse=True)
     final_docs = []
+
+    # CHANGE 1: Track counts per article/schedule to ensure context diversity
+    seen_provisions: Dict[str, int] = {}
 
     for collection_name, point, score in collected_results:
         payload = point.payload or {}
@@ -399,8 +382,7 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
         if not is_english_chunk(content_text):
             continue
 
-        # Problem 3 fix: If user asks how Constitutional Schedule powers are operationalized in an enabling Act,
-        # suppress tail administrative schedules/forms of the Act in favor of substantive sections.
+        # Suppress tail administrative schedules of Acts when querying Constitutional Schedules
         if anchors.get("is_constitutional_schedule_query"):
             doc_type = str(
                 chunk_data.get("doc_type") or payload.get("doc_type") or ""
@@ -411,7 +393,19 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
             if "constitution" not in act_title and (
                 doc_type == "schedule" or chunk_data.get("schedule_number") is not None
             ):
-                continue  # Suppress administrative forms / tail schedules of Acts
+                continue
+
+        # CHANGE 1 (Continued): Enforce Diversity Cap (Max 2 chunks per Article or Schedule)
+        art_num = chunk_data.get("article_number")
+        sched_num = chunk_data.get("schedule_number")
+        prov_key = (
+            f"art_{art_num}"
+            if art_num is not None
+            else (f"sched_{sched_num}" if sched_num is not None else "other")
+        )
+
+        if prov_key != "other" and seen_provisions.get(prov_key, 0) >= 2:
+            continue
 
         doc_key = (
             collection_name,
@@ -424,11 +418,15 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
         )
         if doc_key in seen_keys:
             continue
+
         seen_keys.add(doc_key)
+        seen_provisions[prov_key] = seen_provisions.get(prov_key, 0) + 1
 
         chunk_data["collection_name"] = collection_name
         final_docs.append(chunk_data)
-        if len(final_docs) >= 12:
+
+        # CHANGE 2: Reduced maximum limit from 12 to 8 to avoid token context overflow
+        if len(final_docs) >= 8:
             break
 
     return {"documents": final_docs}
@@ -479,14 +477,20 @@ def generate_answer_node(state: LegalGraphState) -> Dict[str, Any]:
         ),
     ]
     response = llm.invoke(messages)
+    content = str(response.content or "").strip()
+    if not content and hasattr(response, "additional_kwargs"):
+        content = str(
+            response.additional_kwargs.get("reasoning", "")
+            or response.additional_kwargs.get("thinking", "")
+        ).strip()
+
     cleaned_answer = re.sub(
-        r"^User Safety:\s*\w+\s*", "", str(response.content), flags=re.IGNORECASE
+        r"^User Safety:\s*\w+\s*", "", content, flags=re.IGNORECASE
     ).strip()
+
     if not cleaned_answer:
-        cleaned_answer = (
-            "I found relevant legal provisions, but the response service returned "
-            "no answer. Please try again."
-        )
+        cleaned_answer = "Error: The model generated an empty response. Please check your API connection or select an explicit OpenRouter model."
+
     return {"answer": cleaned_answer}
 
 

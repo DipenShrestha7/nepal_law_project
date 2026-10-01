@@ -24,19 +24,12 @@ testing/
 # Data Pipeline & Raw Files
 # ==========================================
 # Ignore scraped raw PDFs and temporary output data
-data/raw_pdfs/
-data/raw_pdfs/*
-data/raw_pdfs_small/np/*
-data/parsed_json/*
-data/qdrant_payloads/*
+data/
 
 # Keep data directory structure intact in Git
 !data/raw_pdfs/.gitkeep
 !data/parsed_json/.gitkeep
 !data/qdrant_payloads/.gitkeep
-
-# Crawl4AI cache directories
-.crawl4ai/
 
 # ==========================================
 # Node.js & React (Backend / Frontend)
