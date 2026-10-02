@@ -62,3 +62,4 @@ scraping/ingester_first/
 scraping/ingester_small/
 scraping/scraper/
 chatbot_tries/
+tries/

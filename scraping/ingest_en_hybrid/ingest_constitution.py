@@ -7,7 +7,7 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from dotenv import load_dotenv
-from chatbot.retrieval_utils_en import embedding_text_en
+from chatbot.utils.retrieval_utils import embedding_text_en
 from fastembed import SparseTextEmbedding
 
 load_dotenv()
