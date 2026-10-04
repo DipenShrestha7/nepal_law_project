@@ -118,5 +118,7 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
 
         if len(final_docs) >= 8:
             break
+    if not final_docs:
+        print("[Retrieval] Qdrant returned 0 documents. Routing to Web Search...")
 
     return {"documents": final_docs}

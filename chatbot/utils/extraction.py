@@ -63,6 +63,14 @@ def extract_statutory_anchors(query: str) -> StatutoryAnchors:
         target_act = "Local Government Operation Act"
     elif re.search(r"\b(?:constitution)\b", text, re.IGNORECASE):
         target_act = "Constitution"
+    else:
+        act_match = re.search(
+            r"\b([A-Z][A-Za-z-]*(?:\s+[A-Z][A-Za-z-]*)*\s+Act)"
+            r"(?:\s*,?\s*\d{4})?\b",
+            text,
+        )
+        if act_match:
+            target_act = re.sub(r"\s+", " ", act_match.group(1)).strip()
 
     return {
         "article_number": article_num,

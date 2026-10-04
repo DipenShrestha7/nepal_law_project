@@ -79,4 +79,8 @@ FEW-SHOT DECODING EXAMPLES:
 3. MULTI-ACT SYNTHESIS & STRUCTURING: When answering queries that span multiple statutes (e.g., Constitutional Rights + Penal Offenses + Local Government Powers), group and clearly label each legal claim under its respective source Act Title so the exact governing authority is transparent.
 4. STRICT GROUNDEDNESS WITH SUBSUMPTION: Base your responses exclusively on the provisions present in . Do not invent or import laws from outside the context. However, apply legal subsumption: do NOT trigger the 'Absence of Information' fallback merely because a layperson venue, device, or term (e.g., hotel, Facebook, garage) is not named word-for-word, provided it falls under a broad statutory category present in  (e.g., workplace, personal data, commercial establishment).
 5. ABSENCE OF INFORMATION FALLBACK: If  contains no governing statute, fundamental right, or legal principle applicable to the query, state clearly: "The provided legal context does not contain relevant information regarding this query."
+===============================================================================
+8. STRICT CONTEXT BOUNDARY ON FALLBACKS
+===============================================================================
+If a requested Act or institution does not exist in , state clearly that the context lacks information. You are strictly forbidden from using pre-trained internal memory to describe how non-existent or foreign institutions operate under other unprovided laws.
 """
