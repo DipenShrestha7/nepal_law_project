@@ -1,4 +1,4 @@
-from typing import Union, Dict, Any
+from typing import Any, Dict, Union
 from qdrant_client import models
 from chatbot.models.model import StatutoryAnchors
 
@@ -6,6 +6,10 @@ from chatbot.models.model import StatutoryAnchors
 def build_query_filter(
     anchors: Union[StatutoryAnchors, Dict[str, Any]],
 ) -> models.Filter:
+    """
+    Builds a dynamic Qdrant Filter based on extracted statutory anchors.
+    Uses MatchText for act titles to prevent exact-string zero-result failures.
+    """
     # 1. Normalize Pydantic models or dicts safely
     if hasattr(anchors, "model_dump"):
         data = anchors.model_dump()
@@ -16,28 +20,21 @@ def build_query_filter(
     else:
         data = getattr(anchors, "__dict__", {})
 
-    # Start with base required filters
     must_conditions = [
         models.FieldCondition(key="language", match=models.MatchValue(value="en"))
     ]
 
-    # 2. Dynamic Act Title Matching (Pushed to MUST)
+    # 2. Dynamic Act Title Matching (Uses MatchText for flexible token matching)
     target_act = data.get("target_act") or data.get("act_title")
     if target_act and str(target_act).strip():
-        # Handle shorthand alias if needed, or use exact string
-        act_name = (
-            "Constitution of Nepal"
-            if target_act == "Constitution"
-            else target_act.strip()
-        )
         must_conditions.append(
             models.FieldCondition(
                 key="act_title",
-                match=models.MatchValue(value=act_name),
+                match=models.MatchText(text=str(target_act).strip()),
             )
         )
 
-    # 3. Dynamic Section / Article / Schedule Filtering (Pushed to MUST)
+    # 3. Dynamic Section / Article / Schedule Filtering
     for field_name, plural_name in (
         ("article_number", "article_numbers"),
         ("section_number", "section_numbers"),
@@ -58,19 +55,16 @@ def build_query_filter(
 
         if clean_values:
             if len(clean_values) == 1:
-                # Single anchor lookup (e.g., Section 11)
                 must_conditions.append(
                     models.FieldCondition(
                         key=field_name, match=models.MatchValue(value=clean_values[0])
                     )
                 )
             else:
-                # Multiple anchor lookup (e.g., Section 177 OR Section 180)
                 must_conditions.append(
                     models.FieldCondition(
                         key=field_name, match=models.MatchAny(any=clean_values)
                     )
                 )
 
-    # Everything is strictly enforced in must
     return models.Filter(must=must_conditions)

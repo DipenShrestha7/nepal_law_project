@@ -21,36 +21,51 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
 
     query_filter = build_query_filter(anchors)
 
+    # 1. PRE-COMPUTE VECTOR EMBEDDINGS ONCE (Saves 50%+ CPU latency)
+    encoded_queries = []
+    for search_text in search_queries:
+        try:
+            dense_vec = embedder.encode(search_text).tolist()
+            sparse_vec = next(iter(sparse_embedder.embed([search_text])))
+            encoded_queries.append((dense_vec, sparse_vec))
+        except Exception as e:
+            print(f"[Retrieval Error] Failed to encode query '{search_text}': {e}")
+
+    # 2. QUERY QDRANT COLLECTIONS
     for collection_name in COLLECTIONS:
         if not qdrant.collection_exists(collection_name):
             continue
 
-        for search_text in search_queries:
-            dense_vector = embedder.encode(search_text).tolist()
-            sparse_vector = next(iter(sparse_embedder.embed([search_text])))
-            points = qdrant.query_points(
-                collection_name=collection_name,
-                prefetch=[
-                    models.Prefetch(query=dense_vector, using="dense", limit=15),
-                    models.Prefetch(
-                        query=models.SparseVector(
-                            indices=sparse_vector.indices.tolist(),
-                            values=sparse_vector.values.tolist(),
+        for dense_vector, sparse_vector in encoded_queries:
+            try:
+                points = qdrant.query_points(
+                    collection_name=collection_name,
+                    prefetch=[
+                        models.Prefetch(query=dense_vector, using="dense", limit=15),
+                        models.Prefetch(
+                            query=models.SparseVector(
+                                indices=sparse_vector.indices.tolist(),
+                                values=sparse_vector.values.tolist(),
+                            ),
+                            using="sparse",
+                            limit=15,
                         ),
-                        using="sparse",
-                        limit=15,
-                    ),
-                ],
-                query=models.FusionQuery(fusion=models.Fusion.RRF),
-                query_filter=query_filter,
-                limit=15,
-            ).points
+                    ],
+                    query=models.FusionQuery(fusion=models.Fusion.RRF),
+                    query_filter=query_filter,
+                    limit=15,
+                ).points
 
-            for point in points:
-                collected_results.append(
-                    (collection_name, point, getattr(point, "score", 1.0))
+                for point in points:
+                    collected_results.append(
+                        (collection_name, point, getattr(point, "score", 1.0))
+                    )
+            except Exception as err:
+                print(
+                    f"[Retrieval Error] Query failed on collection '{collection_name}': {err}"
                 )
 
+    # 3. SORT & DEDUPLICATE RESULTS
     collected_results.sort(key=lambda item: item[2], reverse=True)
     final_docs = []
     seen_provisions: Dict[str, int] = {}
@@ -59,22 +74,24 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
         payload = point.payload or {}
         chunk_data = extract_payload_metadata(point)
         content_text = (
-            chunk_data["content_text"] or chunk_data["parent_content_text"] or ""
+            chunk_data.get("content_text")
+            or chunk_data.get("parent_content_text")
+            or ""
         )
 
+        # Skip oversized schedules
         if (
             chunk_data.get("doc_type") == "schedule"
             and len(content_text) > MAX_SCHEDULE_CONTEXT_CHARS
         ):
-            print(
-                f"Skipping oversized malformed schedule payload from {collection_name}; "
-                "re-run constitution ingestion to refresh it."
-            )
+            print(f"Skipping oversized schedule payload from {collection_name}.")
             continue
 
+        # Language quality check
         if not is_english_chunk(content_text):
             continue
 
+        # Constitutional schedule filter rule
         if anchors.get("is_constitutional_schedule_query"):
             doc_type = str(
                 chunk_data.get("doc_type") or payload.get("doc_type") or ""
@@ -87,25 +104,30 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
             ):
                 continue
 
+        # 4. PROVISION DIVERSITY (Tracks section, article, AND schedule)
+        sec_num = chunk_data.get("section_number")
         art_num = chunk_data.get("article_number")
         sched_num = chunk_data.get("schedule_number")
-        prov_key = (
-            f"art_{art_num}"
-            if art_num is not None
-            else (f"sched_{sched_num}" if sched_num is not None else "other")
-        )
 
+        if sec_num is not None:
+            prov_key = f"sec_{sec_num}"
+        elif art_num is not None:
+            prov_key = f"art_{art_num}"
+        elif sched_num is not None:
+            prov_key = f"sched_{sched_num}"
+        else:
+            prov_key = "other"
+
+        # Cap max 2 chunks per provision to ensure context diversity
         if prov_key != "other" and seen_provisions.get(prov_key, 0) >= 2:
             continue
 
+        # 5. DEDUPLICATION KEY (Uses normalized chunk_data)
         doc_key = (
             collection_name,
             payload.get("file_name"),
-            payload.get("section_number")
-            or payload.get("article_number")
-            or payload.get("schedule_number")
-            or payload.get("title"),
-            payload.get("doc_type"),
+            sec_num or art_num or sched_num or chunk_data.get("title"),
+            chunk_data.get("doc_type"),
         )
         if doc_key in seen_keys:
             continue
@@ -118,6 +140,7 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
 
         if len(final_docs) >= 8:
             break
+
     if not final_docs:
         print("[Retrieval] Qdrant returned 0 documents. Routing to Web Search...")
 
