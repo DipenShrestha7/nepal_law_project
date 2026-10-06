@@ -48,9 +48,16 @@ def generate_answer_node(state: LegalGraphState) -> Dict[str, Any]:
     ]
 
     try:
-        # 4. Invoke LLM
+        # 4. Invoke LLM and extract content cleanly (handles string or list blocks)
         response = llm.invoke(messages)
-        content = str(response.content or "").strip()
+
+        if isinstance(response.content, list):
+            content = "".join(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+                for item in response.content
+            ).strip()
+        else:
+            content = str(response.content or "").strip()
 
         # Fallback for OpenRouter / DeepSeek reasoning models using additional_kwargs
         if not content and hasattr(response, "additional_kwargs"):
@@ -59,8 +66,13 @@ def generate_answer_node(state: LegalGraphState) -> Dict[str, Any]:
                 or response.additional_kwargs.get("thinking", "")
             ).strip()
 
-        # 5. Strip ... reasoning blocks if present
-        content = re.sub(r".*?", "", content, flags=re.DOTALL).strip()
+        # 5. Strip reasoning blocks safely (handles closed AND unclosed truncated tags)
+        content = re.sub(
+            r"<(?:think|thinking)\b[^>]*>.*?(?:|$)",
+            "",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
 
         # 6. Clean legacy system safety prefixes
         cleaned_answer = re.sub(

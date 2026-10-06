@@ -41,19 +41,19 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
                 points = qdrant.query_points(
                     collection_name=collection_name,
                     prefetch=[
-                        models.Prefetch(query=dense_vector, using="dense", limit=15),
+                        models.Prefetch(query=dense_vector, using="dense", limit=20),
                         models.Prefetch(
                             query=models.SparseVector(
                                 indices=sparse_vector.indices.tolist(),
                                 values=sparse_vector.values.tolist(),
                             ),
                             using="sparse",
-                            limit=15,
+                            limit=20,
                         ),
                     ],
                     query=models.FusionQuery(fusion=models.Fusion.RRF),
                     query_filter=query_filter,
-                    limit=15,
+                    limit=20,
                 ).points
 
                 for point in points:
@@ -138,7 +138,7 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
         chunk_data["collection_name"] = collection_name
         final_docs.append(chunk_data)
 
-        if len(final_docs) >= 8:
+        if len(final_docs) >= 10:
             break
 
     if not final_docs:

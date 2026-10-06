@@ -63,3 +63,5 @@ scraping/ingester_small/
 scraping/scraper/
 chatbot_tries/
 tries/
+qdrant_snapshot/
+chatbot/services/act_registry.py

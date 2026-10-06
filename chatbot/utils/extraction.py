@@ -51,23 +51,41 @@ def extract_statutory_anchors(query: str) -> StatutoryAnchors:
         )
     )
 
-    # 5. DYNAMIC TARGET ACT EXTRACTION (100% Dynamic, Zero Hardcoding)
-    # Case-insensitive match for patterns like: "X Act", "X Act, 2074", "X Code", "X Constitution"
+    # 5. DYNAMIC TARGET ACT EXTRACTION
+    # Extract the statute phrase, not the complete sentence leading up to it.
     target_act = None
-    act_match = re.search(
-        r"\b([a-zA-Z0-9-–—\s]+?\b(?:Act|Code|Rules|Regulations|Procedure|Constitution))\b(?:\s*,?\s*\d{4})?",
-        text,
-        re.IGNORECASE,
+    act_matches = list(
+        re.finditer(
+            r"\b([a-zA-Z0-9][a-zA-Z0-9'’&-]*(?:\s+[a-zA-Z0-9][a-zA-Z0-9'’&-]*){0,10}"
+            r"\s+(?:Act|Code|Rules|Regulations|Procedure|Constitution))\b"
+            r"(?:\s*,?\s*(\d{4}))?",
+            text,
+            re.IGNORECASE,
+        )
     )
-    if act_match:
+    if act_matches:
+        act_match = act_matches[-1]
         extracted = act_match.group(1).strip()
-        # Clean up leading noise words like "the", "about the", "under"
+
+        # Keep only the statute phrase when the match began in question text.
+        extracted = re.split(
+            r"\b(?:according\s+to|under|pursuant\s+to|provided\s+by|of|in|from)\b",
+            extracted,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[-1].strip()
+
         extracted_clean = re.sub(
-            r"^(?:what\s+is\s+|about\s+|under\s+|the\s+|in\s+)+",
+            r"^(?:(?:what\s+is|what\s+are|about|under|the|in|of|from)\s+)+",
             "",
             extracted,
             flags=re.IGNORECASE,
-        ).strip()
+        ).strip(" ,:;")
+
+        year = act_match.group(2)
+        if year:
+            extracted_clean = f"{extracted_clean}, {year}"
+
         if len(extracted_clean) > 3:
             target_act = extracted_clean.title()
 
