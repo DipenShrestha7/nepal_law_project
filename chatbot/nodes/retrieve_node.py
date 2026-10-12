@@ -142,6 +142,6 @@ def retrieve_node(state: LegalGraphState) -> Dict[str, Any]:
             break
 
     if not final_docs:
-        print("[Retrieval] Qdrant returned 0 documents. Routing to Web Search...")
+        print("[Retrieval] Qdrant returned 0 documents. Selecting fallback search...")
 
     return {"documents": final_docs}

@@ -7,6 +7,7 @@ from chatbot.nodes.retrieve_node import retrieve_node
 from chatbot.nodes.format_node import format_context_node
 from chatbot.nodes.answer_node import generate_answer_node
 from chatbot.tools.web_tool import web_search_node, route_after_retrieval
+from chatbot.tools.document_tool import doc_search_node
 
 
 def build_english_rag_graph() -> CompiledStateGraph:
@@ -26,6 +27,7 @@ def build_english_rag_graph() -> CompiledStateGraph:
     workflow.add_node("prepare_query", prepare_query_node)
     workflow.add_node("retrieve", retrieve_node)
     workflow.add_node("web_search", web_search_node)
+    workflow.add_node("doc_search", doc_search_node)
     workflow.add_node("format_context", format_context_node)
     workflow.add_node("generate", generate_answer_node)
 
@@ -40,11 +42,13 @@ def build_english_rag_graph() -> CompiledStateGraph:
         {
             "web_search": "web_search",
             "generate": "format_context",  # Redirects local retrieval output to format_context
+            "doc_search": "doc_search",  # Redirects to PDF search & extraction if needed
         },
     )
 
     # 4. Connect fallback path into context formatting
     workflow.add_edge("web_search", "format_context")
+    workflow.add_edge("doc_search", "format_context")
 
     # 5. Connect formatting output to answer generation and termination
     workflow.add_edge("format_context", "generate")

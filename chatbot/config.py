@@ -9,3 +9,4 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 COLLECTION_NAME = ["nepal_laws_en", "nepal_laws_np"]
 SCORE_THRESHOLD = 0.25
 FALLBACK_SCORE_THRESHOLD = 0.10
+DEFAULT_MODEL = "openrouter/free"

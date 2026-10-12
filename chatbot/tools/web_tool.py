@@ -40,11 +40,30 @@ def web_search_node(state: LegalGraphState):
 
 
 def route_after_retrieval(state: LegalGraphState):
-    """Decides whether to go to Generator or Web Search Fallback."""
+    """Choose local context, full-document search, or general web search."""
     documents = state.get("documents", [])
 
-    # If Qdrant returned no documents, fallback to Web Search
-    if not documents:
-        return "web_search"
+    if documents:
+        return "generate"
 
-    return "generate"
+    question = state.get("question", "").lower()
+    needs_full_document = any(
+        keyword in question
+        for keyword in (
+            "act",
+            "ain",
+            "section",
+            "dafa",
+            "punishment",
+            "fine",
+            "provision",
+            "law",
+            "statute",
+            "rule",
+            "code",
+            "ऐन",
+            "दफा",
+        )
+    )
+
+    return "doc_search" if needs_full_document else "web_search"
