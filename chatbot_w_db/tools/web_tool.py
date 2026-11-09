@@ -1,11 +1,11 @@
 from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
-from langchain_community.tools import TavilySearchResults
+from langchain_tavily import TavilySearch
 from chatbot.models.model import LegalGraphState
 
 load_dotenv()
 
-web_search_tool = TavilySearchResults(k=3)
+web_search_tool = TavilySearch(k=3)
 
 
 def search_web(query: str):

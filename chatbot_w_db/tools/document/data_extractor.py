@@ -1,4 +1,4 @@
-import fitz
+import pymupdf
 import re
 import os
 import unicodedata
@@ -28,7 +28,7 @@ def extract_and_split_pdf_in_memory(pdf_bytes: bytes) -> list[str]:
     Extracts text from PDF bytes in RAM and splits into logical sections.
     Supports both English and Devanagari text.
     """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     full_text = ""
 
     for page in doc:
@@ -76,7 +76,38 @@ def filter_top_sections_in_memory(
     bm25 = BM25Okapi(tokenized_corpus)
     top_sections = bm25.get_top_n(tokenized_query, sections, n=top_k)
 
-    return top_sections
+    # A PDF may be split at sub-clause boundaries (for example, 29(1)(a)).
+    # Expand each BM25 hit to every chunk belonging to its parent section so
+    # penalties, exceptions, and appeal periods are returned together.
+    section_patterns = (
+        re.compile(r"^\s*Section\s+(\d+)", re.IGNORECASE),
+        re.compile(r"^\s*दफा\s+(\d+)"),
+    )
+
+    def parent_section_key(section: str) -> tuple[str, str] | None:
+        for pattern in section_patterns:
+            match = pattern.match(section)
+            if match:
+                return (pattern.pattern, match.group(1))
+        return None
+
+    sections_by_parent: dict[tuple[str, str], list[str]] = {}
+    for section in sections:
+        key = parent_section_key(section)
+        if key is not None:
+            sections_by_parent.setdefault(key, []).append(section)
+
+    expanded_sections: list[str] = []
+    seen_sections: set[str] = set()
+    for hit in top_sections:
+        key = parent_section_key(hit)
+        candidates = sections_by_parent.get(key, [hit]) if key is not None else [hit]
+        for section in candidates:
+            if section not in seen_sections:
+                expanded_sections.append(section)
+                seen_sections.add(section)
+
+    return expanded_sections
 
 
 async def translate_snippets_if_needed(snippets: list[str], is_english: bool) -> str:
@@ -135,7 +166,7 @@ async def live_web_search_and_extract(act_name: str, user_query: str) -> dict:
 
     # 3. Filter top 3 most relevant sections using BM25
     top_snippets = filter_top_sections_in_memory(
-        sections=sections, user_query=user_query, top_k=3
+        sections=sections, user_query=user_query, top_k=7
     )
 
     if not top_snippets:

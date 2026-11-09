@@ -3,10 +3,10 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from urllib.parse import urljoin, unquote
-import fitz  # PyMuPDF
+import pymupdf
 import httpx
 from bs4 import BeautifulSoup
-from langchain_community.tools import TavilySearchResults
+from langchain_tavily import TavilySearch
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -41,7 +41,7 @@ def is_english_pdf_bytes(pdf_bytes: bytes) -> bool:
     Returns True if Devanagari ratio is under 10% (indicating English).
     """
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         if len(doc) == 0:
             return False
 
@@ -283,7 +283,7 @@ def score_candidate_document(url: str, page1_text: str, is_english: bool) -> int
 class WebDocumentFetcher:
     def __init__(self, tavily_api_key: str | None = None):
         # Fetch up to 10 candidate links to inspect deeper results
-        self.search_tool = TavilySearchResults(max_results=10)
+        self.search_tool = TavilySearch(max_results=10)
 
     async def _search_web_for_links(self, act_name: str) -> list[str]:
         """
@@ -297,7 +297,18 @@ class WebDocumentFetcher:
 
         try:
             results = await self.search_tool.ainvoke({"query": query})
-            urls = [res.get("url") for res in results if res.get("url")]
+
+            if isinstance(results, dict):
+                results = results.get("results", [])
+            elif not isinstance(results, list):
+                results = []
+
+            urls = []
+            for res in results:
+                if isinstance(res, dict) and res.get("url"):
+                    urls.append(res["url"])
+                elif isinstance(res, str) and res.startswith("http"):
+                    urls.append(res)
 
             if urls:
                 return urls
@@ -350,7 +361,7 @@ class WebDocumentFetcher:
 
                 # Extract first page text safely
                 try:
-                    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
                     page1_text = doc[0].get_text("text") if len(doc) > 0 else ""
                 except Exception:
                     page1_text = ""

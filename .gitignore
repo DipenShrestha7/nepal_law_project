@@ -65,3 +65,4 @@ chatbot_tries/
 tries/
 qdrant_snapshot/
 chatbot/services/act_registry.py
+bot/

@@ -14,6 +14,9 @@ SYSTEM_EXPANSION_PROMPT = ChatPromptTemplate.from_messages(
             "system",
             """You are an expert Nepalese legal search query optimizer. 
 Your task is to convert a user's query into 2-3 distinct, keyword-dense legal search queries formatted for Hybrid Vector Search across Nepalese statutory laws, acts, and regulations.
+Convert the following legal query into a rich search query containing:
+    1. Formal legal terms and synonyms (e.g., 'haddamyad' -> 'limitation period, time limit for appeal, 35 days').
+    2. Primary statutory keywords.
 
 GUIDELINES:
 1. Translate layperson terms into formal statutory vocabulary used in Nepalese legal texts (e.g., convert "murder" -> "homicide prohibition causing death", "doxxing" -> "privacy data character record", "firing" -> "employment termination dismissal").
