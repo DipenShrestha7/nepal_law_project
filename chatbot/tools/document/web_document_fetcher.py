@@ -1,15 +1,18 @@
-import asyncio
+import gc
 import re
-import unicodedata
 from dataclasses import dataclass
-from urllib.parse import urljoin, unquote
-import pymupdf
+from typing import List
+from urllib.parse import unquote, urljoin
+
 import httpx
+import pymupdf
 from bs4 import BeautifulSoup
-from langchain_tavily import TavilySearch
 from dotenv import load_dotenv
+from langchain_tavily import TavilySearch
 
 load_dotenv()
+
+MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024  # 15 MB safety cap for 512 MB RAM environments
 
 # ============================================================================
 # 1. Output Data Structure
@@ -35,30 +38,26 @@ class DocumentFetchResult:
 # ============================================================================
 
 
-def is_english_pdf_bytes(pdf_bytes: bytes) -> bool:
+def inspect_pdf_bytes(pdf_bytes: bytes) -> tuple[bool, str]:
     """
-    Inspects page 1 of a PDF and calculates the ratio of Devanagari characters.
-    Returns True if Devanagari ratio is under 10% (indicating English).
+    Safely inspects page 1 of a PDF in a context manager (preventing C-heap leaks).
+    Returns (is_english, page1_text).
     """
     try:
-        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        if len(doc) == 0:
-            return False
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if len(doc) == 0:
+                return False, ""
 
-        # Extract text from page 1 for rapid detection
-        first_page_text = doc[0].get_text("text").strip()
-        if not first_page_text:
-            return False
+            first_page_text = doc[0].get_text("text").strip()
+            if not first_page_text:
+                return False, ""
 
-        # Count Devanagari Unicode characters (\u0900 to \u097F)
-        devanagari_chars = len(re.findall(r"[\u0900-\u097F]", first_page_text))
-        total_chars = max(len(first_page_text), 1)
-
-        devanagari_ratio = devanagari_chars / total_chars
-        return devanagari_ratio < 0.10
-
+            devanagari_chars = len(re.findall(r"[\u0900-\u097F]", first_page_text))
+            total_chars = max(len(first_page_text), 1)
+            is_english = (devanagari_chars / total_chars) < 0.10
+            return is_english, first_page_text
     except Exception:
-        return False
+        return False, ""
 
 
 def is_complete_html_statute(html_str: str) -> bool:
@@ -69,11 +68,9 @@ def is_complete_html_statute(html_str: str) -> bool:
     soup = BeautifulSoup(html_str, "html.parser")
     clean_text = soup.get_text(separator=" ")
 
-    # Exclude short summaries (complete statutes are rarely under 6,000 chars)
     if len(clean_text) < 6000:
         return False
 
-    # Verify structural statutory markers
     clean_text_lower = clean_text.lower()
     en_markers = ["section", "sub-section", "preamble", "chapter", "enacted by"]
     ne_markers = ["दफा", "उपदफा", "प्रस्तावना", "परिच्छेद", "ऐन"]
@@ -85,73 +82,167 @@ def is_complete_html_statute(html_str: str) -> bool:
 
 
 # ============================================================================
-# 3. HTML & Embedded PDF Resolver
+# 3. Safe HTTP Streamer & HTML/Embedded PDF Resolver
 # ============================================================================
+
+
+async def _safe_get(
+    client: httpx.AsyncClient, url: str, timeout: float = 15.0
+) -> tuple[int, str, bytes]:
+    """
+    Streams response bytes up to MAX_DOWNLOAD_BYTES so oversized PDFs never trigger OOM.
+    Returns (status_code, content_type, body_bytes).
+    """
+    async with client.stream(
+        "GET", url, timeout=timeout, follow_redirects=True
+    ) as response:
+        content_type = response.headers.get("content-type", "").lower()
+        if response.status_code != 200:
+            return response.status_code, content_type, b""
+
+        content_length = response.headers.get("content-length")
+        if content_length and content_length.isdigit():
+            if int(content_length) > MAX_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"File exceeds {MAX_DOWNLOAD_BYTES // (1024 * 1024)}MB limit"
+                )
+
+        chunks = bytearray()
+        async for chunk in response.aiter_bytes(chunk_size=65536):
+            chunks.extend(chunk)
+            if len(chunks) > MAX_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"File exceeded {MAX_DOWNLOAD_BYTES // (1024 * 1024)}MB limit"
+                )
+
+        return 200, content_type, bytes(chunks)
+
+
+def _extract_pdf_links_from_html(
+    base_url: str, html_text: str
+) -> tuple[list[str], list[str]]:
+    """
+    Extracts embedded PDF URLs (from tags, viewer query params, or raw JS/text URLs)
+    and Law Commission detail URLs from an HTML page.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    pdf_urls: list[str] = []
+    detail_urls: list[str] = []
+
+    for tag in soup.find_all(["iframe", "embed", "object", "a"]):
+        src = tag.get("src") or tag.get("data") or tag.get("href")
+        if not src:
+            continue
+
+        src = unquote(src)
+        if "file=" in src:
+            match = re.search(r"[?&]file=([^&]+)", src)
+            if match:
+                src = match.group(1)
+
+        full_url = urljoin(base_url, src)
+        if ".pdf" in full_url.lower() and full_url not in pdf_urls:
+            pdf_urls.append(full_url)
+        elif (
+            "lawcommission.gov.np/content/" in full_url.lower()
+            and full_url not in detail_urls
+        ):
+            detail_urls.append(full_url)
+
+    # Fallback: extract direct PDF URLs embedded in JS or viewer text (e.g. giwmscdnone.gov.np)
+    for raw_pdf in re.findall(
+        r'https?://[^\s"\'<>]+\.pdf', html_text, flags=re.IGNORECASE
+    ):
+        clean_pdf = unquote(raw_pdf)
+        if clean_pdf not in pdf_urls:
+            pdf_urls.append(clean_pdf)
+
+    return pdf_urls, detail_urls
 
 
 async def resolve_and_download_url(client: httpx.AsyncClient, url: str) -> dict:
     """
-    Fetches a URL. Direct PDFs are returned immediately.
-    If the URL is an HTML landing page with an embedded PDF viewer (e.g. lawcommission.gov.np),
-    parses the DOM to find and download the hidden PDF.
+    Fetches a URL safely. Direct PDFs are returned immediately.
+    If the URL is an HTML landing page with an embedded PDF viewer, extracts and downloads the PDF.
     """
     try:
-        response = await client.get(url, timeout=12.0, follow_redirects=True)
-        if response.status_code != 200:
+        status, content_type, body = await _safe_get(client, url, timeout=15.0)
+        if status != 200 or not body:
             return {"valid": False, "url": url}
 
-        content_type = response.headers.get("content-type", "").lower()
-
         # Case A: Direct PDF Link
-        if "application/pdf" in content_type or response.content.startswith(b"%PDF"):
+        if "application/pdf" in content_type or body.startswith(b"%PDF"):
             return {
                 "valid": True,
                 "url": url,
-                "file_bytes": response.content,
+                "file_bytes": body,
                 "file_type": "pdf",
             }
 
-        # Case B: HTML Landing Page (May contain embedded PDF viewer)
+        # Case B: HTML Landing Page
         if "text/html" in content_type:
-            soup = BeautifulSoup(response.text, "html.parser")
-            embedded_pdf_url = None
+            html_text = body.decode("utf-8", errors="ignore")
+            del body
 
-            # Look for <iframe>, <embed>, <object>, or <a> pointing to a PDF or PDF viewer
-            for tag in soup.find_all(["iframe", "embed", "object", "a"]):
-                src = tag.get("src") or tag.get("data") or tag.get("href")
-                if not src:
+            pdf_urls, detail_urls = _extract_pdf_links_from_html(url, html_text)
+
+            for pdf_url in pdf_urls[:3]:
+                try:
+                    p_status, _, p_body = await _safe_get(client, pdf_url, timeout=15.0)
+                    if p_status == 200 and p_body.startswith(b"%PDF"):
+                        return {
+                            "valid": True,
+                            "url": pdf_url,
+                            "file_bytes": p_body,
+                            "file_type": "embedded_pdf",
+                        }
+                except Exception:
                     continue
 
-                # Unquote URL parameters (e.g., viewer.html?file=/pdf/law.pdf)
-                src = unquote(src)
+            for detail_url in detail_urls[:3]:
+                try:
+                    d_status, _, d_body = await _safe_get(
+                        client, detail_url, timeout=15.0
+                    )
+                    if d_status != 200 or not d_body:
+                        continue
+                    if d_body.startswith(b"%PDF"):
+                        return {
+                            "valid": True,
+                            "url": detail_url,
+                            "file_bytes": d_body,
+                            "file_type": "pdf",
+                        }
 
-                if "file=" in src:
-                    match = re.search(r"[?&]file=([^&]+)", src)
-                    if match:
-                        src = match.group(1)
+                    d_html = d_body.decode("utf-8", errors="ignore")
+                    del d_body
+                    sub_pdfs, _ = _extract_pdf_links_from_html(detail_url, d_html)
+                    for sub_pdf in sub_pdfs[:2]:
+                        p_status, _, p_body = await _safe_get(
+                            client, sub_pdf, timeout=15.0
+                        )
+                        if p_status == 200 and p_body.startswith(b"%PDF"):
+                            return {
+                                "valid": True,
+                                "url": sub_pdf,
+                                "file_bytes": p_body,
+                                "file_type": "embedded_pdf",
+                            }
 
-                if ".pdf" in src.lower():
-                    embedded_pdf_url = urljoin(url, src)
-                    break
+                    if is_complete_html_statute(d_html):
+                        return {
+                            "valid": True,
+                            "url": detail_url,
+                            "file_text": d_html,
+                            "file_type": "html_text",
+                        }
+                except Exception:
+                    continue
 
-            # If an embedded PDF link was extracted, download it
-            if embedded_pdf_url:
-                pdf_res = await client.get(
-                    embedded_pdf_url, timeout=12.0, follow_redirects=True
-                )
-                if pdf_res.status_code == 200 and pdf_res.content.startswith(b"%PDF"):
-                    return {
-                        "valid": True,
-                        "url": embedded_pdf_url,
-                        "file_bytes": pdf_res.content,
-                        "file_type": "embedded_pdf",
-                    }
-
-            # If no embedded PDF exists, return HTML text for completeness verification
             return {
                 "valid": True,
                 "url": url,
-                "file_text": response.text,
+                "file_text": html_text,
                 "file_type": "html_text",
             }
 
@@ -165,7 +256,6 @@ async def resolve_and_download_url(client: httpx.AsyncClient, url: str) -> dict:
 # 4. Domain & Content Scoring Constants
 # ============================================================================
 
-# Blacklisted repositories that hold user uploads, student notes, or SEO blogs
 BLACKLISTED_DOMAINS = [
     "slideshare.net",
     "coursehero.com",
@@ -178,11 +268,27 @@ BLACKLISTED_DOMAINS = [
     "wordpress.com",
     "blogspot.com",
     "medium.com",
+    "apnilaw.com",
+    "indiankanoon",
+    "nepjol.info",
+    "article/download",
+    ".co.za",
+    ".gov.in",
 ]
 
-# Trusted archives for official and legal texts
+FOREIGN_STATUTE_DOMAINS = [
+    ".co.za",
+    ".gov.in",
+    "indiankanoon",
+    "legislation.gov.uk",
+    "leginfo.legislature.ca.gov",
+]
+
 TRUSTED_ARCHIVES = [
     "lawcommission.gov.np",
+    "giwmscdnone.gov.np",
+    "ican.org.np",
+    "bwcimplementation.org",
     "natlex.ilo.org",
     "ilo.org",
     "molpa.gov.np",
@@ -192,11 +298,9 @@ TRUSTED_ARCHIVES = [
     "fwld.org",
 ]
 
-# Current acts should outrank historical/repealed editions when both are found.
-CURRENT_EDITION_MARKERS = ["2019", "2076", "२०७६"]
+CURRENT_EDITION_MARKERS = ["2017", "2074", "2076", "२०१७", "२०७४", "२०७६"]
 HISTORICAL_EDITION_MARKERS = ["1993", "2049", "२०४९"]
 
-# Official legal publishing and statutory structural markers
 STATUTORY_MARKERS = [
     "act no.",
     "an act relating to",
@@ -207,7 +311,6 @@ STATUTORY_MARKERS = [
     "authentication date",
 ]
 
-# Penalty phrases for user commentary or unofficial drafts
 USER_SUMMARY_PENALTIES = [
     "submitted by",
     "assignment",
@@ -219,33 +322,107 @@ USER_SUMMARY_PENALTIES = [
     "submitted to",
     "draft bill",
     "proposal",
+    "abstract:",
+    "keywords:",
+    "law review",
+    "nepal law review",
+    "issn",
+    "doi:",
+    "journal of",
 ]
 
 
-def score_candidate_document(url: str, page1_text: str, is_english: bool) -> int:
+def build_search_queries(act_en: str, act_ne: str) -> List[str]:
+    """Build ordered statutory PDF queries for English and Nepali document lookup."""
+    raw_en = act_en.replace("(Code)", "Code").strip()
+    title_variants = [raw_en]
+    variant_without_code = re.sub(
+        r"\s*\(Code\)", "", raw_en, flags=re.IGNORECASE
+    ).strip()
+    variant_without_national = re.sub(
+        r"^National\s+", "", variant_without_code, flags=re.IGNORECASE
+    ).strip()
+    year_stripped = re.sub(r",\s*\d{4}(?:\s*\(\d{4}\))?$", "", raw_en).strip()
+
+    for variant in (
+        variant_without_code,
+        variant_without_national,
+        year_stripped,
+    ):
+        if variant and variant not in title_variants:
+            title_variants.append(variant)
+
+    act_ne = act_ne.strip()
+    queries = []
+    for title_variant in title_variants:
+        queries.extend(
+            [
+                f'"{title_variant}" Nepal PDF',
+                f'"{title_variant}" Nepal site:lawcommission.gov.np',
+                f'"{title_variant}" Nepal site:gov.np',
+                f'"{title_variant}" Nepal Act PDF English',
+            ]
+        )
+    if act_ne:
+        queries.append(f'"{act_ne}" नेपाल site:lawcommission.gov.np')
+        queries.append(f'"{act_ne}" नेपाल PDF')
+
+    return queries
+
+
+def score_candidate_document(
+    url: str,
+    page1_text: str,
+    is_english: bool,
+    expected_title: str | None = None,
+) -> int:
     """
     Calculates a relevance & authority score based on legal structure, domain authority,
-    and penalty keywords rather than strict domain filtering.
+    and penalty keywords.
     """
     url_lower = url.lower()
     text_lower = page1_text.lower()
 
-    # 1. Instant Disqualification for Blacklisted Repositories
-    if any(junk_domain in url_lower for junk_domain in BLACKLISTED_DOMAINS):
+    if any(junk in url_lower for junk in BLACKLISTED_DOMAINS):
+        return -500
+    if any(foreign in url_lower for foreign in FOREIGN_STATUTE_DOMAINS):
         return -500
 
-    score = 0
+    # Immediately disqualify academic journal papers (both PDF and HTML)
+    if any(
+        marker in text_lower[:1500]
+        for marker in ("abstract:", "keywords:", "law review", "issn", "doi:")
+    ):
+        return -500
 
-    # 2. Language Preference (+50 for English, +10 for Devanagari)
-    if is_english:
-        score += 50
-    else:
-        score += 10
+    if expected_title:
+        expected = expected_title.lower()
+        relevance_text = f"{url_lower} {text_lower}"
+        if "penal" in expected or "criminal code" in expected:
+            if not any(
+                marker in relevance_text
+                for marker in ("penal", "criminal code", "muluki", "फौजदारी")
+            ):
+                return -500
+        elif "labour" in expected or "labor" in expected:
+            if "labour" not in relevance_text and "labor" not in relevance_text:
+                return -500
+        else:
+            significant_words = [
+                word
+                for word in re.findall(r"[a-z]{4,}", expected)
+                if word not in {"act", "nepal", "code", "national"}
+            ]
+            if significant_words and not any(
+                word in relevance_text for word in significant_words
+            ):
+                return -500
 
-    # 3. Known Legal Archive Domain Boost (+40)
+    score = 50 if is_english else 10
+
     if any(domain in url_lower for domain in TRUSTED_ARCHIVES):
         score += 40
-    if "lawcommission.gov.np" in url_lower:
+    if "lawcommission.gov.np" in url_lower or "giwmscdnone.gov.np" in url_lower:
         score += 60
 
     if any(
@@ -259,18 +436,38 @@ def score_candidate_document(url: str, page1_text: str, is_english: bool) -> int
     ):
         score -= 100
 
-    # 4. Statutory Structural Headers (+30 points each)
     for marker in STATUTORY_MARKERS:
         if marker in text_lower:
             score += 30
 
-    # 5. Penalties for Unofficial Disclaimers (-80) and Student Notes (-150)
     if "unofficial translation" in text_lower:
         score -= 80
 
     for penalty in USER_SUMMARY_PENALTIES:
         if penalty in text_lower or penalty in url_lower:
             score -= 150
+
+    if url_lower.endswith(".pdf"):
+        score += 60
+    if any(
+        d in url_lower for d in (".gov.np", "faolex.fao.org", "lawcommission.gov.np")
+    ):
+        score += 100
+
+    is_nepal_source = (
+        ".gov.np" in url_lower
+        or "nepal" in text_lower
+        or "नेपाल" in page1_text
+        or any(domain in url_lower for domain in TRUSTED_ARCHIVES)
+    )
+    if not is_nepal_source:
+        return -500
+
+    if (
+        "short title and commencement" in text_lower
+        or "संक्षिप्त नाम र प्रारम्भ" in page1_text
+    ):
+        score += 80
 
     return score
 
@@ -282,117 +479,150 @@ def score_candidate_document(url: str, page1_text: str, is_english: bool) -> int
 
 class WebDocumentFetcher:
     def __init__(self, tavily_api_key: str | None = None):
-        # Fetch up to 10 candidate links to inspect deeper results
         self.search_tool = TavilySearch(max_results=10)
 
-    async def _search_web_for_links(self, act_name: str) -> list[str]:
+    async def _search_web_for_links(
+        self, act_name: str, act_en: str | None = None, act_ne: str | None = None
+    ) -> list[str]:
+        """Searches the web using ordered statutory anchor phrases."""
+        official_en = (act_en or act_name).strip()
+        official_ne = (act_ne or "").strip()
+        urls: list[str] = []
+        seen_urls: set[str] = set()
+
+        for query in build_search_queries(official_en, official_ne):
+            try:
+                results = await self.search_tool.ainvoke({"query": query})
+                if isinstance(results, dict):
+                    results = results.get("results", [])
+                elif not isinstance(results, list):
+                    results = []
+
+                for res in results:
+                    url = (
+                        res.get("url")
+                        if isinstance(res, dict)
+                        else (
+                            res
+                            if isinstance(res, str) and res.startswith("http")
+                            else None
+                        )
+                    )
+                    if (
+                        url
+                        and url not in seen_urls
+                        and not any(
+                            blocked in url.lower() for blocked in BLACKLISTED_DOMAINS
+                        )
+                        and not any(
+                            foreign in url.lower()
+                            for foreign in FOREIGN_STATUTE_DOMAINS
+                        )
+                    ):
+                        seen_urls.add(url)
+                        urls.append(url)
+            except Exception as e:
+                print(f"[Search Warning] Query failed: {query}: {e}")
+
+            if len(urls) >= 10:
+                break
+
+        return urls[:10]
+
+    async def fetch_best_document(
+        self, act_name: str, act_en: str | None = None, act_ne: str | None = None
+    ) -> DocumentFetchResult:
         """
-        Searches the open web using statutory anchor phrases without site restriction.
+        Searches candidate URLs, checks top 4 sequentially in RAM, scores each document,
+        and returns the highest-scoring verified DocumentFetchResult.
         """
-        # Primary Query: Target official act anchor phrases across the web
-        query = (
-            f'"{act_name}" Nepal current prevailing law latest 2026 2083'
-            f"official English PDF"
-        )
-
-        try:
-            results = await self.search_tool.ainvoke({"query": query})
-
-            if isinstance(results, dict):
-                results = results.get("results", [])
-            elif not isinstance(results, list):
-                results = []
-
-            urls = []
-            for res in results:
-                if isinstance(res, dict) and res.get("url"):
-                    urls.append(res["url"])
-                elif isinstance(res, str) and res.startswith("http"):
-                    urls.append(res)
-
-            if urls:
-                return urls
-        except Exception as e:
-            print(f"[Search Warning] Primary query failed: {e}")
-
-        # Fallback Query: Broader legal search if primary query yields no links
-        fallback_query = (
-            f'"{act_name}" Nepal current prevailing law official '
-            f"lawcommission.gov.np PDF"
-        )
-        try:
-            results = await self.search_tool.ainvoke({"query": fallback_query})
-            return [res.get("url") for res in results if res.get("url")]
-        except Exception as e:
-            print(f"[Search Error] Fallback query failed: {e}")
-            return []
-
-    async def fetch_best_document(self, act_name: str) -> DocumentFetchResult:
-        """
-        Executes search, inspects top 10 candidate URLs concurrently, resolves HTML viewers,
-        checks language, scores candidates, and selects the optimal document.
-        """
-        urls = await self._search_web_for_links(act_name)
+        urls = await self._search_web_for_links(act_name, act_en, act_ne)
         if not urls:
             return DocumentFetchResult(
                 success=False,
                 error_message=f"No search results found for '{act_name}'.",
             )
 
+        clean_urls = [
+            u for u in urls if not any(bad in u.lower() for bad in BLACKLISTED_DOMAINS)
+        ]
+        clean_urls.sort(
+            key=lambda u: (".gov.np" in u.lower(), u.lower().endswith(".pdf")),
+            reverse=True,
+        )
+
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/pdf,text/html,application/xhtml+xml,*/*;q=0.9",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "close",
         }
 
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-            # Inspect top 10 candidate URLs concurrently
-            tasks = [resolve_and_download_url(client, url) for url in urls[:10]]
-            candidates = await asyncio.gather(*tasks)
+        MIN_ACCEPTABLE_SCORE = 30
+        HIGH_CONFIDENCE_SCORE = 150
+        evaluated_results: list[dict] = []
 
-        scored_candidates = []
+        async with httpx.AsyncClient(
+            headers=headers,
+            follow_redirects=True,
+            timeout=15.0,
+            verify=False,
+        ) as client:
+            # Inspect and score top 4 candidates ONE BY ONE
+            for url in clean_urls[:4]:
+                candidate = await resolve_and_download_url(client, url)
+                if not candidate.get("valid"):
+                    continue
 
-        for candidate in candidates:
-            if not candidate.get("valid"):
-                continue
+                file_type = candidate.get("file_type")
 
-            # Case A: PDF Documents
-            if candidate["file_type"] in ["pdf", "embedded_pdf"]:
-                pdf_bytes = candidate["file_bytes"]
-                is_english = is_english_pdf_bytes(pdf_bytes)
+                # Case A: PDF Documents
+                if file_type in ("pdf", "embedded_pdf"):
+                    pdf_bytes = candidate["file_bytes"]
+                    is_english, page1_text = inspect_pdf_bytes(pdf_bytes)
 
-                # Extract first page text safely
-                try:
-                    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-                    page1_text = doc[0].get_text("text") if len(doc) > 0 else ""
-                except Exception:
-                    page1_text = ""
+                    score = score_candidate_document(
+                        url=candidate["url"],
+                        page1_text=page1_text,
+                        is_english=is_english,
+                        expected_title=act_name,
+                    )
 
-                # Calculate authority & relevance score
-                score = score_candidate_document(
-                    url=candidate["url"], page1_text=page1_text, is_english=is_english
-                )
+                    if score < MIN_ACCEPTABLE_SCORE:
+                        del pdf_bytes, candidate
+                        gc.collect()
+                        continue
 
-                scored_candidates.append(
-                    {
-                        "score": score,
-                        "result": DocumentFetchResult(
-                            success=True,
-                            source_url=candidate["url"],
-                            file_bytes=pdf_bytes,
-                            file_type=candidate["file_type"],
-                            is_english=is_english,
-                            target_collection=(
-                                "core_english_statutes"
-                                if is_english
-                                else "nepali_legal_chunks"
-                            ),
+                    result_obj = DocumentFetchResult(
+                        success=True,
+                        source_url=candidate["url"],
+                        file_bytes=pdf_bytes,
+                        file_type=file_type,
+                        is_english=is_english,
+                        target_collection=(
+                            "core_english_statutes"
+                            if is_english
+                            else "nepali_legal_chunks"
                         ),
-                    }
-                )
+                    )
+                    evaluated_results.append({"score": score, "result": result_obj})
 
-            # Case B: Complete Plain HTML Text (If no embedded PDF was found)
-            elif candidate["file_type"] == "html_text":
-                html_str = candidate.get("file_text", "")
-                if is_complete_html_statute(html_str):
+                    # Stop immediately if we found an authoritative statute PDF
+                    if score >= HIGH_CONFIDENCE_SCORE:
+                        break
+
+                # Case B: Complete Plain HTML Text
+                elif file_type == "html_text":
+                    html_str = candidate.get("file_text", "")
+                    if not is_complete_html_statute(html_str):
+                        del html_str, candidate
+                        gc.collect()
+                        continue
+
                     devanagari_chars = len(re.findall(r"[\u0900-\u097F]", html_str))
                     is_english = (devanagari_chars / max(len(html_str), 1)) < 0.10
 
@@ -400,44 +630,46 @@ class WebDocumentFetcher:
                         url=candidate["url"],
                         page1_text=html_str[:2000],
                         is_english=is_english,
+                        expected_title=act_name,
                     )
 
-                    scored_candidates.append(
-                        {
-                            "score": score,
-                            "result": DocumentFetchResult(
-                                success=True,
-                                source_url=candidate["url"],
-                                file_text=html_str,
-                                file_type="html_statute",
-                                is_english=is_english,
-                                target_collection=(
-                                    "core_english_statutes"
-                                    if is_english
-                                    else "nepali_legal_chunks"
-                                ),
-                            ),
-                        }
+                    if score < MIN_ACCEPTABLE_SCORE:
+                        del html_str, candidate
+                        gc.collect()
+                        continue
+
+                    result_obj = DocumentFetchResult(
+                        success=True,
+                        source_url=candidate["url"],
+                        file_text=html_str,
+                        file_type="html_statute",
+                        is_english=is_english,
+                        target_collection=(
+                            "core_english_statutes"
+                            if is_english
+                            else "nepali_legal_chunks"
+                        ),
                     )
+                    evaluated_results.append({"score": score, "result": result_obj})
 
-        # --- RANK AND RETURN HIGHEST SCORE ABOVE THRESHOLD ---
-        MIN_ACCEPTABLE_SCORE = 30
+                    if score >= HIGH_CONFIDENCE_SCORE:
+                        break
 
-        if scored_candidates:
-            scored_candidates.sort(key=lambda x: x["score"], reverse=True)
-            best_candidate = scored_candidates[0]
+        if evaluated_results:
+            evaluated_results.sort(key=lambda x: x["score"], reverse=True)
+            best = evaluated_results[0]
 
-            if best_candidate["score"] >= MIN_ACCEPTABLE_SCORE:
-                print(
-                    f"[Selection Success] Selected URL: {best_candidate['result'].source_url} "
-                    f"(Score: {best_candidate['score']})"
-                )
-                return best_candidate["result"]
-            else:
-                print(
-                    f"[Selection Rejected] Best candidate score ({best_candidate['score']}) "
-                    f"did not meet minimum threshold ({MIN_ACCEPTABLE_SCORE})."
-                )
+            # Free RAM from any lower-scoring candidates before returning
+            for other in evaluated_results[1:]:
+                other["result"].file_bytes = None
+                other["result"].file_text = None
+            gc.collect()
+
+            print(
+                f"[Selection Success] Selected URL: {best['result'].source_url} "
+                f"(Score: {best['score']})"
+            )
+            return best["result"]
 
         return DocumentFetchResult(
             success=False,

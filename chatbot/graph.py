@@ -40,13 +40,11 @@ def build_english_rag_graph() -> CompiledStateGraph:
         {
             "web_search": "web_search",
             "generate": "format_context",  # Redirects local retrieval output to format_context
-            "doc_search": "doc_search",  # Redirects to PDF search & extraction if needed
         },
     )
 
     # 4. Connect fallback path into context formatting
     workflow.add_edge("web_search", "format_context")
-    workflow.add_edge("doc_search", "format_context")
 
     # 5. Connect formatting output to answer generation and termination
     workflow.add_edge("format_context", "generate")

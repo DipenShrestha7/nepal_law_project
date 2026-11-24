@@ -12,8 +12,12 @@ class StatutoryAnchors(TypedDict):
     is_constitutional_schedule_query: bool
 
 
-class LegalGraphState(TypedDict):
+class LegalGraphState(TypedDict, total=False):
     question: str
+    official_act_en: str
+    official_act_ne: str
+    statutory_keywords: List[str]
+    sub_queries: List[str]
     search_query: str
     search_queries: List[str]
     anchors: StatutoryAnchors

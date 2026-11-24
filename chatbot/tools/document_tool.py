@@ -1,5 +1,4 @@
 import asyncio
-
 from chatbot.tools.document.data_extractor import live_web_search_and_extract
 from chatbot.models.model import LegalGraphState
 
@@ -10,7 +9,11 @@ def doc_search_node(state: LegalGraphState) -> dict:
     a specific legal act is missing from the local database.
     """
     question = state.get("question", "")
-    target_act = (state.get("anchors") or {}).get("target_act") or question
+    anchors = state.get("anchors") or {}
+    target_act = state.get("official_act_en") or anchors.get("target_act") or question
+
+    act_en = state.get("official_act_en") or target_act
+    act_ne = state.get("official_act_ne") or ""
     print(
         f"[Node: doc_search] Fetching & extracting official document for: '{target_act}'"
     )
@@ -19,6 +22,8 @@ def doc_search_node(state: LegalGraphState) -> dict:
         live_web_search_and_extract(
             act_name=target_act,
             user_query=question,
+            act_en=act_en,
+            act_ne=act_ne,
         )
     )
 

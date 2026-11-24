@@ -28,34 +28,28 @@ def extract_and_split_pdf_in_memory(pdf_bytes: bytes) -> list[str]:
     Extracts text from PDF bytes in RAM and splits into logical sections.
     Supports both English and Devanagari text.
     """
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     full_text = ""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for page in doc:
+            text = page.get_text("text").strip()
+            if text:
+                full_text += text + "\n"
 
-    for page in doc:
-        text = page.get_text("text").strip()
-        if text:
-            full_text += text + "\n"
-
-    # Normalize Unicode (NFC)
     full_text = unicodedata.normalize("NFC", full_text)
     full_text = re.sub(r"\s+", " ", full_text)
 
-    # Split by section markers: 'दफा' for Nepali, 'Section' for English
-    if "दफा" in full_text:
-        sections = [
-            f"दफा {sec.strip()}"
-            for sec in full_text.split("दफा")
-            if len(sec.strip()) > 30
-        ]
-    elif "Section" in full_text:
-        sections = [
-            f"Section {sec.strip()}"
-            for sec in full_text.split("Section")
-            if len(sec.strip()) > 30
-        ]
+    # Split ONLY at actual section headings (e.g., "Section 14." or "दफा १४.")
+    if re.search(r"दफा\s*[\d०-९]+\s*[\.:।\-]", full_text):
+        raw_parts = re.split(r"(?=दफा\s*[\d०-९]+\s*[\.:।\-])", full_text)
+        sections = [p.strip() for p in raw_parts if len(p.strip()) > 30]
+    elif re.search(r"\bSection\s+\d+\s*[\.:\-]", full_text, flags=re.IGNORECASE):
+        raw_parts = re.split(
+            r"(?=\bSection\s+\d+\s*[\.:\-])", full_text, flags=re.IGNORECASE
+        )
+        sections = [p.strip() for p in raw_parts if len(p.strip()) > 30]
     else:
-        # Fallback to 800-character paragraph chunks
-        sections = [full_text[i : i + 800] for i in range(0, len(full_text), 700)]
+        # Larger 2,500-character fallback chunks (with 300-char overlap)
+        sections = [full_text[i : i + 2500] for i in range(0, len(full_text), 2200)]
 
     return sections
 
@@ -134,7 +128,12 @@ async def translate_snippets_if_needed(snippets: list[str], is_english: bool) ->
     return response.content
 
 
-async def live_web_search_and_extract(act_name: str, user_query: str) -> dict:
+async def live_web_search_and_extract(
+    act_name: str,
+    user_query: str,
+    act_en: str | None = None,
+    act_ne: str | None = None,
+) -> dict:
     """
     Master Live Pipeline:
     1. Searches web (inspects up to 10 files, prefers English).
@@ -147,22 +146,36 @@ async def live_web_search_and_extract(act_name: str, user_query: str) -> dict:
     print(f"[Live Fetch] Searching web for latest version of '{act_name}'...")
 
     # 1. Inspect up to 10 candidate files (Prefers English, falls back to Nepali)
-    fetch_result: DocumentFetchResult = await fetcher.fetch_best_document(act_name)
+    fetch_result: DocumentFetchResult = await fetcher.fetch_best_document(
+        act_name=act_name,
+        act_en=act_en,
+        act_ne=act_ne,
+    )
 
-    if not fetch_result.success or not fetch_result.file_bytes:
+    if not fetch_result.success:
         return {
             "success": False,
             "error": fetch_result.error_message
             or "Could not retrieve document from web.",
         }
 
-    print(f"[Live Fetch] Downloaded document from: {fetch_result.source_url}")
+    print(f"[Live Fetch] Retrieved document from: {fetch_result.source_url}")
     print(
         f"[Live Fetch] Language: {'English' if fetch_result.is_english else 'Nepali (Devanagari)'}"
     )
 
-    # 2. Extract & Split PDF in RAM
-    sections = extract_and_split_pdf_in_memory(fetch_result.file_bytes)
+    # 2. Extract & split either a PDF or complete HTML statute in memory
+    if fetch_result.file_bytes:
+        sections = extract_and_split_pdf_in_memory(fetch_result.file_bytes)
+    elif fetch_result.file_text:
+        text = unicodedata.normalize("NFC", fetch_result.file_text)
+        text = re.sub(r"\s+", " ", text).strip()
+        sections = [text[i : i + 800] for i in range(0, len(text), 700)] if text else []
+    else:
+        return {
+            "success": False,
+            "error": "Document retrieval returned no usable PDF or HTML text.",
+        }
 
     # 3. Filter top 3 most relevant sections using BM25
     top_snippets = filter_top_sections_in_memory(

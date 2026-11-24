@@ -10,22 +10,60 @@ web_search_tool = TavilySearch(k=3)
 
 def search_web(query: str):
     """Run Tavily and normalize results for the legal-document pipeline."""
+    blacklisted_domains = (
+        "apnilaw.com",
+        "slideshare.net",
+        "coursehero.com",
+        "studocu.com",
+        "scribd.com",
+        "academia.edu",
+        "researchgate.net",
+        "github.com",
+        "drive.google.com",
+        "wordpress.com",
+        "blogspot.com",
+        "medium.com",
+    )
     search_results = web_search_tool.invoke({"query": query})
-    return [
-        {
-            "act_title": "Web Search Result",
-            "title": result.get("title") or "Web Search Result",
-            "section_number": "N/A",
-            "article_number": None,
-            "chapter": "N/A",
-            "schedule_number": None,
-            "content_text": result.get("content") or "",
-            "source_url": result.get("url") or "",
-            "doc_type": "web_search",
-            "collection_name": "web",
-        }
-        for result in search_results
-    ]
+    if isinstance(search_results, dict):
+        search_results = search_results.get("results", [])
+    elif not isinstance(search_results, list):
+        search_results = []
+
+    documents = []
+    for result in search_results:
+        if isinstance(result, dict):
+            url = result.get("url") or ""
+            title = result.get("title") or "Web Search Result"
+            content = result.get("content") or ""
+        elif isinstance(result, str):
+            url = result if result.startswith("http") else ""
+            title = "Web Search Result"
+            content = ""
+        else:
+            continue
+
+        if not url:
+            continue
+        if any(blocked in url.lower() for blocked in blacklisted_domains):
+            continue
+
+        documents.append(
+            {
+                "act_title": "Web Search Result",
+                "title": title,
+                "section_number": "N/A",
+                "article_number": None,
+                "chapter": "N/A",
+                "schedule_number": None,
+                "content_text": content,
+                "source_url": url,
+                "doc_type": "web_search",
+                "collection_name": "web",
+            }
+        )
+
+    return documents
 
 
 def web_search_node(state: LegalGraphState):
@@ -40,30 +78,10 @@ def web_search_node(state: LegalGraphState):
 
 
 def route_after_retrieval(state: LegalGraphState):
-    """Choose local context, full-document search, or general web search."""
+    """Choose formatted document context or the general web-search fallback."""
     documents = state.get("documents", [])
 
     if documents:
         return "generate"
 
-    question = state.get("question", "").lower()
-    needs_full_document = any(
-        keyword in question
-        for keyword in (
-            "act",
-            "ain",
-            "section",
-            "dafa",
-            "punishment",
-            "fine",
-            "provision",
-            "law",
-            "statute",
-            "rule",
-            "code",
-            "ऐन",
-            "दफा",
-        )
-    )
-
-    return "doc_search" if needs_full_document else "web_search"
+    return "web_search"
